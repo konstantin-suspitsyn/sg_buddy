@@ -1,0 +1,29 @@
+[project]
+name = "sg-buddy"
+version = "0.1.0"
+description = "SG Buddy — генератор sqlc-запросов и .proto по DDL-схеме"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "nicegui>=2.10",
+    "sqlglot>=25.0",
+    "pydantic>=2.7",
+]
+
+[project.scripts]
+sgbuddy = "sgbuddy.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sgbuddy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
