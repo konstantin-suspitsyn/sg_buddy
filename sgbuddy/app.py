@@ -21,7 +21,8 @@ from pathlib import Path
 from nicegui import app, ui
 
 from .ddl import DDLError, Table, parse_schema_file
-from .query_gen import GenerationError, default_query_path, generate
+from .proto_gen import generate as generate_proto
+from .query_gen import QUERY_FILENAME, GenerationError, default_query_path, generate
 from .settings import (
     ANNOTATION_KEY,
     COLUMN_NAME_KEY,
@@ -34,6 +35,7 @@ from .settings import (
     MODE_KEY,
     NAME_KEY,
     PAGINATION_KEY,
+    SAVE_PROTO_KEY,
     SET_KEY,
     SET_VALUE_KEY,
     SETTINGS_FILENAME,
@@ -54,6 +56,8 @@ from .settings import (
 
 ASSETS = Path(__file__).parent / "assets"
 LOGO = "/assets/hacker_dog.png"
+# Картинки лежат в пакете: программа работает без сети и без соседних репозиториев.
+MASCOT = "/assets/working_dog.png"
 
 SCHEMA_FILENAME = "schema.sql"
 PROTO_SUFFIX = ".proto"
@@ -68,10 +72,14 @@ ANNOTATIONS = ("one", "exec")
 READ_ANNOTATIONS = ("one", "many")
 UPDATE_ANNOTATIONS = ("exec", "one")
 
-# Удаление: физическое стирает строку, мягкое проставляет колонки.
+# Удаление: физическое стирает строку, мягкое проставляет колонки, обратное
+# возвращает их к прежним значениям. Мягкое и обратное устроены одинаково —
+# это `UPDATE ... SET`, — и различаются только тем, что автор пишет в значения.
 HARD_DELETE = "DELETE"
 SOFT_DELETE = "SOFT DELETE"
-DELETE_MODES = (HARD_DELETE, SOFT_DELETE)
+UNDELETE = "UNDELETE"
+DELETE_MODES = (HARD_DELETE, SOFT_DELETE, UNDELETE)
+SET_MODES = (SOFT_DELETE, UNDELETE)
 ANNOTATION_HELP = "SQLC Query annotations"
 
 CUSTOM_WHERE_HELP = (
@@ -124,17 +132,17 @@ STYLES = """
     font-family: var(--font-head);
   }
 
-  /* Шапка — цвет и правило снизу как в макете. */
+  /* Шапка — цвет и правило снизу как в макете. Содержимое лежит в общем
+     `.container`, как в подвале и на странице: только так собака в шапке и
+     собака в подвале стоят на одной вертикали, а не каждая по своему отступу. */
   .app-header {
     background: var(--dark-bg) !important;
     backdrop-filter: blur(6px);
     border-bottom: 1px solid var(--dark-rule);
     box-shadow: none;
     color: var(--dark-ink);
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 8px 24px;
+    display: block;
+    padding: 8px 0;
   }
   .app-title {
     font-weight: 700;
@@ -142,16 +150,58 @@ STYLES = """
     letter-spacing: -0.003em;
     color: var(--dark-ink);
   }
-  /* Логотип 54x62 — размер натуральный, ничего не масштабируем.
-     pixelated нужен, чтобы пиксель-арт не мылился на экранах с DPR > 1. */
+  /* Собаки в шапке и подвале: 54x62 и 62x59 — размер натуральный, ничего не
+     масштабируем. pixelated нужен, чтобы пиксель-арт не мылился при DPR > 1. */
   .app-logo {
     display: block;
     flex-shrink: 0;
     image-rendering: pixelated;
   }
 
+  /* Подвал — того же цвета, что и шапка. Правило зеркальное: там снизу, тут сверху.
+
+     Раскладку низа держим сами. Quasar меряет высоту подвала один раз при
+     старте и вписывает запас инлайном в `q-page-container`; наблюдателя размера
+     у подвала нет, поэтому картинка, добавившая высоты, в запас не попадает — и
+     длинная страница уезжает под полосу. Вместо запаса делаем колонку во всю
+     высоту окна: страница растягивается, подвал идёт следом обычным потоком. */
+  .q-layout {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  .q-page-container {
+    flex: 1 0 auto;
+    padding-bottom: 0 !important;
+  }
+  .q-page {
+    min-height: 0 !important;
+  }
+  .app-footer {
+    position: static;
+    background: var(--dark-bg) !important;
+    backdrop-filter: blur(6px);
+    border-top: 1px solid var(--dark-rule);
+    box-shadow: none;
+    color: var(--dark-ink);
+    padding: 26px 0;
+  }
+  .footer-copy {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: rgba(243, 245, 249, 0.6);
+  }
+
   /* ---------- страница ---------- */
 
+  /* Сетку по горизонтали задаёт только `.container`, поэтому боковой отступ
+     NiceGUI снимаем: иначе содержимое страницы уезжает на 16px вправо от шапки
+     и подвала — они лежат вне этой обёртки. Сверху и снизу, наоборот, отступ
+     нужен: страница не должна упираться в тёмные полосы. Держим его здесь, а не
+     классами `q-pt-*` на обёртке, — их правило `.container` перебивает. */
+  .nicegui-content {
+    padding: 24px 0 40px;
+  }
   .container {
     max-width: 1240px;
     margin: 0 auto;
@@ -403,6 +453,8 @@ class Workspace:
 
     proto: Path | None = None
     proto_error: str | None = None
+    # Путь к .proto из schema.json, который уже лежал в выбранной папке.
+    saved_proto: Path | None = None
 
     tables: list[Table] | None = None
     settings: dict | None = None
@@ -413,6 +465,10 @@ class Workspace:
     # Результат последней генерации query.sql.
     query_file: Path | None = None
     query_problems: list | None = None
+
+    # То же для .proto. Путь к файлу отдельным полем не держим: он выбран на
+    # шаге 2 и лежит в `proto`.
+    proto_problems: list | None = None
 
     selected_table: str | None = None
     selected_action: str | None = None
@@ -477,7 +533,30 @@ def _validate_folder(raw: str | None) -> str:
 
     workspace.folder = path
     workspace.schema = schema
+    workspace.saved_proto = _saved_proto_path(path)
     return ""
+
+
+def _saved_proto_path(folder: Path) -> Path | None:
+    """Путь к `.proto` из уже лежащего в папке `schema.json`, если он там есть.
+
+    Файл почти всегда остался от прошлого запуска на этой же схеме, и прежний
+    путь — лучшая подсказка, чем имя по умолчанию. Читаем мягко: битый или
+    чужой файл на выборе папки спотыкаться не должен, его разберёт шаг 3.
+    """
+    path = settings_path(folder)
+    if not path.is_file():
+        return None
+
+    try:
+        data = load_settings(path)
+    except (OSError, ValueError):
+        return None
+
+    saved = data.get(SAVE_PROTO_KEY)
+    if not isinstance(saved, str) or not saved.strip():
+        return None
+    return Path(saved.strip())
 
 
 # «Другая папка» — тот же сброс: путь к .proto от прежней схемы почти наверняка
@@ -589,9 +668,12 @@ def _proto_card() -> None:
 def _proto_picker() -> None:
     ui.label("Файл контракта").classes("field-label")
 
+    # Путь из прежних настроек важнее имени по умолчанию: его уже выбирали руками.
+    suggested = workspace.saved_proto or default_proto_path()
+
     with ui.row().classes("w-full items-center gap-3 no-wrap q-mt-xs"):
         path_input = (
-            ui.input(value=str(default_proto_path()))
+            ui.input(value=str(suggested))
             .props("outlined dense")
             .classes("grow")
         )
@@ -602,9 +684,14 @@ def _proto_picker() -> None:
             "unelevated no-caps"
         ).classes("btn-primary")
 
-    ui.label(
-        f"можно указать папку — файл получит имя по умолчанию, {default_proto_path().name}"
-    ).classes("hint q-mt-xs")
+    if workspace.saved_proto is not None:
+        ui.label(f"путь взят из {SETTINGS_FILENAME} — можно заменить").classes(
+            "hint q-mt-xs"
+        )
+    else:
+        ui.label(
+            f"можно указать папку — файл получит имя по умолчанию, {default_proto_path().name}"
+        ).classes("hint q-mt-xs")
 
     if workspace.proto_error:
         ui.label(workspace.proto_error).classes("error-text q-mt-sm")
@@ -690,6 +777,9 @@ def _summary_card() -> None:
                 "Сгенерировать query.sql", on_click=_generate_query, color=None
             ).props("unelevated no-caps").classes("btn-primary")
             ui.button(
+                f"Сгенерировать {PROTO_SUFFIX}", on_click=_generate_proto, color=None
+            ).props("unelevated no-caps").classes("btn-primary")
+            ui.button(
                 "Другая папка", on_click=reset_all, color=None
             ).props("flat no-caps").classes("btn-secondary")
 
@@ -706,10 +796,18 @@ def _summary_card() -> None:
                 ui.label(caption).classes("field-label w-24 shrink-0")
                 ui.label(str(value)).classes("path-line")
 
-        for problem in workspace.query_problems or []:
-            ui.label(str(problem)).classes(
-                "error-text q-mt-xs" if problem.fatal else "hint q-mt-xs"
-            )
+        # Списки проблем разные у двух генераторов — подписываем, чей какой.
+        for caption, group in (
+            (QUERY_FILENAME, workspace.query_problems),
+            (PROTO_SUFFIX, workspace.proto_problems),
+        ):
+            if not group:
+                continue
+            ui.label(caption).classes("field-label q-mt-sm")
+            for problem in group:
+                ui.label(str(problem)).classes(
+                    "error-text q-mt-xs" if problem.fatal else "hint q-mt-xs"
+                )
 
 
 def _generate_query() -> None:
@@ -724,6 +822,36 @@ def _generate_query() -> None:
 
     workspace.query_file = path
     workspace.query_problems = problems
+
+    # path is None — генератор отказался писать: прежний файл цел, и говорить
+    # надо про него, а не про «записано».
+    if path is None:
+        blocking = [p for p in problems if p.blocks_file]
+        ui.notify(
+            f"{QUERY_FILENAME} не тронут: {blocking[0].message}", type="negative"
+        )
+        wizard.refresh()
+        return
+
+    broken = sum(1 for problem in problems if problem.fatal)
+    if broken:
+        ui.notify(f"записано: {path}; пропущено запросов: {broken}", type="warning")
+    else:
+        ui.notify(f"записано: {path}", type="positive")
+    wizard.refresh()
+
+
+def _generate_proto() -> None:
+    """Пишет .proto по выбранному на шаге 2 пути из того, что сейчас в настройках."""
+    try:
+        path, problems = generate_proto(
+            workspace.settings, workspace.tables, workspace.proto
+        )
+    except (GenerationError, OSError) as err:
+        ui.notify(str(err), type="negative")
+        return
+
+    workspace.proto_problems = problems
 
     broken = sum(1 for problem in problems if problem.fatal)
     if broken:
@@ -806,8 +934,11 @@ def pluralize(word: str) -> str:
     return word + "s"
 
 
-def where_fields(table: Table, checked: set[str], values: dict[str, str]) -> list[str]:
+def where_fields(
+    table: Table, checked: set[str], values: dict[str, str] | None = None
+) -> list[str]:
     """Колонки, попавшие в WHERE: галкой или заполненным значением."""
+    values = values or {}
     return [
         col.name
         for col in table.columns
@@ -824,10 +955,16 @@ def suggest_create_name(table: Table) -> str:
 
 
 def suggest_read_name(table: Table, draft: "ReadForm") -> str:
+    """Имя по галкам WHERE. EXACT WHERE в него не входит.
+
+    Заполненный EXACT WHERE сам по себе условия не даёт — он лишь подставляет
+    значение вместо параметра в колонку, уже отмеченную галкой. Считать его
+    отбором значило бы приписывать имени условие, которого в запросе нет.
+    """
     entity = table_camel(table)
     if draft.annotation == "many":
         entity = pluralize(entity)
-    return f"Get{entity}" + _by_suffix(where_fields(table, draft.where, draft.exact))
+    return f"Get{entity}" + _by_suffix(where_fields(table, draft.where))
 
 
 def suggest_update_name(table: Table, draft: "UpdateForm") -> str:
@@ -837,7 +974,13 @@ def suggest_update_name(table: Table, draft: "UpdateForm") -> str:
 
 
 def suggest_delete_name(table: Table, draft: "DeleteForm") -> str:
-    return f"Delete{table_camel(table)}" + _by_suffix(
+    """`DeleteAlias`, а в режиме UNDELETE — `UndeleteAlias`.
+
+    Обратное удаление противоположно двум другим режимам по смыслу, и в
+    `query.sql` они лежат рядом: имя — единственное, что их различает.
+    """
+    verb = "Undelete" if draft.mode == UNDELETE else "Delete"
+    return f"{verb}{table_camel(table)}" + _by_suffix(
         where_fields(table, draft.where, draft.where_values)
     )
 
@@ -1696,7 +1839,9 @@ class DeleteForm:
     table: str
     name: str = ""
     mode: str = HARD_DELETE
-    # Колонки мягкого удаления: по умолчанию проставляются все.
+    # Колонки мягкого и обратного удаления: по умолчанию не отмечена ни одна.
+    # Проставляют обычно две-три служебные колонки, а не всю таблицу, — отмечать
+    # заранее все значило бы заставлять снимать лишние галки руками.
     sets: set[str] = field(default_factory=set)
     set_values: dict[str, str] = field(default_factory=dict)
     where: set[str] = field(default_factory=set)
@@ -1714,10 +1859,7 @@ delete_form: DeleteForm | None = None
 def delete_form_for(table: Table) -> DeleteForm:
     global delete_form
     if delete_form is None or delete_form.table != table.name:
-        delete_form = DeleteForm(
-            table=table.name,
-            sets={col.name for col in table.columns},
-        )
+        delete_form = DeleteForm(table=table.name)
     return delete_form
 
 
@@ -1736,7 +1878,7 @@ def _submit_delete(table: Table) -> None:
         wizard.refresh()
         return
 
-    soft = draft.mode == SOFT_DELETE
+    soft = draft.mode in SET_MODES
 
     def column(col) -> dict:
         described = {COLUMN_NAME_KEY: col.name}
@@ -1788,8 +1930,8 @@ def _edit_delete(index: int, table: Table) -> None:
         table=table.name,
         name=entry.get(NAME_KEY, ""),
         mode=mode,
-        # У физического удаления колонок изменения нет — вернём умолчание.
-        sets=flagged(SET_KEY) if mode == SOFT_DELETE else {c.name for c in table.columns},
+        # У физического удаления колонок изменения нет вовсе — там и брать нечего.
+        sets=flagged(SET_KEY),
         set_values=filled(SET_VALUE_KEY),
         where=flagged(WHERE_KEY),
         where_optional=flagged(WHERE_OPTIONAL_KEY),
@@ -1828,7 +1970,7 @@ def _delete_form(table: Table) -> None:
         # Набор колонок у режимов разный — перерисовываем форму целиком.
         wizard.refresh()
 
-    soft = draft.mode == SOFT_DELETE
+    soft = draft.mode in SET_MODES
 
     ui.label("Название").classes("field-label q-mt-md")
     ui.input(
@@ -1925,7 +2067,7 @@ def _delete_list(table: Table) -> None:
         for index, entry in enumerate(entries):
             editing = delete_form is not None and delete_form.editing == index
             columns = entry.get(COLUMNS_KEY, [])
-            soft = entry.get(MODE_KEY) == SOFT_DELETE
+            soft = entry.get(MODE_KEY) in SET_MODES
 
             def listed(flag: str, value_key: str) -> str:
                 parts = [
@@ -2020,13 +2162,28 @@ def build() -> None:
         ui.colors(primary=ACCENT)
 
         with ui.header().classes("app-header"):
-            ui.html(f'<img class="app-logo" src="{LOGO}" alt="SG Buddy">')
-            ui.label("SG Buddy").classes("app-title")
-            ui.space()
-            ui.button(
-                "Начать заново", on_click=reset_all, color=None
-            ).props("flat no-caps").classes("btn-ghost")
+            with ui.element("div").classes("container"):
+                with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                    ui.html(
+                        f'<img class="app-logo" src="{LOGO}" width="54" height="62" '
+                        'alt="SG Buddy">'
+                    )
+                    ui.label("SG Buddy").classes("app-title")
+                    ui.space()
+                    ui.button(
+                        "Начать заново", on_click=reset_all, color=None
+                    ).props("flat no-caps").classes("btn-ghost")
 
         # NiceGUI сама оборачивает содержимое страницы в <main> — второй не нужен.
-        with ui.element("div").classes("container q-pb-xl"):
+        with ui.element("div").classes("container"):
             wizard()
+
+        # fixed=False: подвал стоит под страницей, а не прилипает к низу окна —
+        # мастер длинный, полоса поверх содержимого мешала бы.
+        with ui.footer(fixed=False).classes("app-footer"):
+            with ui.element("div").classes("container"):
+                with ui.row().classes("w-full items-center gap-3 no-wrap"):
+                    # Размеры проставлены явно, чтобы высота подвала была известна
+                    # до загрузки картинки и страница не дёргалась при отрисовке.
+                    ui.html(f'<img class="app-logo" src="{MASCOT}" width="62" height="59" alt="">')
+                    ui.label("SG BUDDY · SELF-HOSTED · SELF-BI · КОГДА ПСУ ДЕЛАТЬ НЕЧЕГО").classes("footer-copy")

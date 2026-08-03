@@ -1,8 +1,9 @@
 """`schema.json` — настройки одной DDL-схемы. Лежит рядом со `schema.sql`.
 
-Файл начинается со строк-комментариев: JSON их не знает, поэтому пишем их
-как в JSONC (`//`) перед объектом и снимаем при чтении. Комментарий нужен,
-чтобы человек, открывший файл в редакторе, сразу понимал, кто его создал.
+Пояснение «что это за файл» лежит первым ключом `description`: комментариев
+JSON не знает, а человеку, открывшему файл в редакторе, надо сразу понимать,
+кто его создал. Раньше на этом месте были строки `//` — файлы той поры на
+дисках есть, и чтение их снимает (см. `_strip_header`).
 """
 
 from __future__ import annotations
@@ -13,13 +14,14 @@ from pathlib import Path
 SETTINGS_FILENAME = "schema.json"
 
 # Шапка файла. Правится здесь и только здесь.
-HEADER_COMMENT = (
-    "// Файл создан программой SG Buddy.",
-    "// Здесь лежат настройки генерации query.sql и .proto по DDL-схеме.",
-    "// Программа перезаписывает файл целиком, когда сохраняет настройки.",
+DESCRIPTION_KEY = "description"
+DESCRIPTION = (
+    "Файл создан программой SG Buddy. "
+    "Здесь лежат настройки генерации query.sql и .proto по DDL-схеме. "
+    "Программа перезаписывает файл целиком, когда сохраняет настройки."
 )
 
-# Порядок этих двух ключей в файле фиксирован: сначала папка схемы, потом .proto.
+# Порядок первых трёх ключей фиксирован: пояснение, папка схемы, .proto.
 SCHEMA_FOLDER_KEY = "schema_folder_path"
 SAVE_PROTO_KEY = "save_proto_path"
 
@@ -113,25 +115,33 @@ def settings_path(folder: str | Path) -> Path:
 
 
 def default_settings(folder: str | Path, proto: str | Path) -> dict:
-    """Стандартные параметры нового файла — пока только два пути."""
+    """Стандартные параметры нового файла — пояснение и два пути."""
     return {
+        DESCRIPTION_KEY: DESCRIPTION,
         SCHEMA_FOLDER_KEY: str(folder),
         SAVE_PROTO_KEY: str(proto),
     }
 
 
 def with_paths(data: dict, folder: str | Path, proto: str | Path) -> dict:
-    """Возвращает настройки, где два путевых ключа стоят первыми и актуальны.
+    """Возвращает настройки, где шапка и два путевых ключа стоят первыми.
 
     Пути — то, что выбрано в интерфейсе сейчас; всё остальное из файла
-    сохраняется как есть.
+    сохраняется как есть. `description` переписывается нашим текстом: это
+    подпись программы, а не пользовательское поле.
     """
-    rest = {k: v for k, v in data.items() if k not in (SCHEMA_FOLDER_KEY, SAVE_PROTO_KEY)}
-    return {SCHEMA_FOLDER_KEY: str(folder), SAVE_PROTO_KEY: str(proto), **rest}
+    head = (DESCRIPTION_KEY, SCHEMA_FOLDER_KEY, SAVE_PROTO_KEY)
+    rest = {k: v for k, v in data.items() if k not in head}
+    return {
+        DESCRIPTION_KEY: DESCRIPTION,
+        SCHEMA_FOLDER_KEY: str(folder),
+        SAVE_PROTO_KEY: str(proto),
+        **rest,
+    }
 
 
 def load_settings(path: str | Path) -> dict:
-    """Читает файл, снимая строки-комментарии в шапке."""
+    """Читает файл, снимая строки-комментарии в шапке старых файлов."""
     text = Path(path).read_text(encoding="utf-8")
     body = _strip_header(text)
     data = json.loads(body)
@@ -143,8 +153,7 @@ def load_settings(path: str | Path) -> dict:
 def save_settings(data: dict, path: str | Path) -> Path:
     """Пишет через временный файл: прерванная запись не должна убить настройки."""
     target = Path(path)
-    body = json.dumps(data, ensure_ascii=False, indent=2)
-    text = "\n".join([*HEADER_COMMENT, body, ""])
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -153,7 +162,11 @@ def save_settings(data: dict, path: str | Path) -> Path:
 
 
 def _strip_header(text: str) -> str:
-    """Убирает ведущие строки `//` — всё, что за ними, обязано быть валидным JSON."""
+    """Убирает ведущие строки `//` из файлов старого формата.
+
+    Сами мы такую шапку больше не пишем — пояснение лежит ключом `description`,
+    — но файлы с комментариями на дисках есть, и падать на них нельзя.
+    """
     lines = text.splitlines()
     start = 0
     for index, line in enumerate(lines):

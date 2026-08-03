@@ -56,13 +56,15 @@ uv run pytest                       # тестов сейчас нет: tests/ �
 
 ## Формат `schema.json`
 
-Лежит рядом со `schema.sql`. Начинается со строк `//` (JSONC) — обычный
-`json.loads` его не съест, читать только через `settings.load_settings`.
+Лежит рядом со `schema.sql`. Чистый JSON: пояснение «что это за файл» —
+первым ключом `description`, комментариев в файле нет. Читать всё равно через
+`settings.load_settings`: файлы прежнего формата начинались со строк `//`
+(JSONC), и `_strip_header` их снимает.
 
 ```
-// Файл создан программой SG Buddy.
 {
-  "schema_folder_path": "...",   // всегда первые два ключа
+  "description": "...",          // подпись программы, перезаписывается при каждом сохранении
+  "schema_folder_path": "...",   // эти три ключа всегда первые и в этом порядке
   "save_proto_path": "...",
   "CRUD": {
     "dc.alias": {                // таблица целиком, с именем схемы
@@ -76,7 +78,8 @@ uv run pytest                       # тестов сейчас нет: tests/ �
 Набор ключей внутри `columns` **разный у направлений**: у CREATE это
 `column_value`, у READ — `show`/`where`/`where_optional`/`exact_where`,
 у UPDATE — `set`/`set_value`/`where`/`where_optional`/`where_value`,
-у DELETE — то же, но `set`/`set_value` пишутся только в режиме `SOFT DELETE`.
+у DELETE — то же, но `set`/`set_value` пишутся только в режимах `SOFT DELETE`
+и `UNDELETE` (оба дают `UPDATE ... SET`, а `DELETE` — физическое удаление).
 
 Правила, которые легко нарушить незаметно:
 
