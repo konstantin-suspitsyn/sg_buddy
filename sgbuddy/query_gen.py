@@ -12,12 +12,22 @@
   простит, а писать выборку без счётчика — молча менять смысл настроек;
 * аннотация запроса берётся из настроек; `one` для вставки и изменения означает
   `RETURNING *`, потому что sqlc обязан вернуть строку;
+* колонка пишется с именем таблицы — `"user".id`, `alias.name`. Не везде:
+  `INSERT` перечисляет свои колонки, а `UPDATE ... SET` называет изменяемые, —
+  там имя таблицы Postgres не примет, и они остаются как есть;
 * пустое значение колонки — это параметр `@имя_колонки`, заполненное
   подставляется в SQL как есть (`now()`, `false`, подзапрос);
 * обязательный фильтр даёт `колонка = значение`, необязательный —
   `(значение IS NULL OR колонка = значение)` с приведением типа из DDL, чтобы
   sqlc понимал тип параметра;
 * `custom_where` приклеивается к остальным условиям через `AND`;
+* сортировка: обычные колонки дают `ORDER BY кол1, кол2`, необязательные —
+  булевы параметры `@order_by_<колонка>::boolean` в одном `CASE`, где вызывающий
+  флагом включает нужную. `ELSE` — первая обычная колонка сортировки, а если таких нет,
+  первая колонка DDL: без `ELSE` порядок пропал бы совсем. **У `many` порядок
+  есть всегда**, даже когда не отмечено ничего, — иначе постраничная выборка
+  начинает повторять и терять строки. Счётчику страниц сортировка не достаётся:
+  считать она не помогает, а параметры бы добавила;
 * режим удаления решает, что за запрос получится: `DELETE` даёт `DELETE FROM`,
   `SOFT DELETE` и `UNDELETE` — одинаковый `UPDATE ... SET`. Обратное удаление
   отличается от мягкого только значениями, которые автор написал колонкам;
@@ -48,6 +58,8 @@ from .settings import (
     EXACT_WHERE_KEY,
     MODE_KEY,
     NAME_KEY,
+    ORDER_BY_KEY,
+    ORDER_BY_OPTIONAL_KEY,
     PAGINATION_KEY,
     SET_KEY,
     SET_VALUE_KEY,
@@ -60,7 +72,7 @@ from .settings import (
 QUERY_FILENAME = "query.sql"
 
 HEADER = (
-    "-- Файл сгенерирован программой SG Buddy.",
+    "-- Файл сгенерирован программой SG Buddy https://github.com/konstantin-suspitsyn/sg_buddy",
     "-- Правки будут затёрты при следующей генерации: правьте настройки, а не этот файл.",
 )
 
@@ -76,6 +88,13 @@ SET_MODES = (SOFT_DELETE, UNDELETE)
 
 # Аннотация по умолчанию, если её нет в настройках (у DELETE её нет вовсе).
 DEFAULT_ANNOTATION = {"CREATE": "exec", "READ": "many", "UPDATE": "exec", "DELETE": "exec"}
+
+# Флаг необязательной сортировки: к имени колонки спереди. `@order_by_created_at`
+# читается сам по себе — по номеру («optional_1») понять ничего нельзя. Тип
+# пишем явно: sqlc вывел бы его и из сравнения с `true`, но такого столбца в
+# схеме нет, и генератору контракта тип взять больше неоткуда.
+ORDER_PARAM = "@order_by_"
+ORDER_PARAM_CAST = "::boolean"
 
 # Постраничность: имена параметров фиксированы, иначе их неоткуда взять.
 # Тип пишем явно — sqlc не выводит его для параметров LIMIT/OFFSET сам.
@@ -127,6 +146,20 @@ class Problem:
 
 
 @dataclass(frozen=True)
+class Ordering:
+    """Сортировка выборки: флаги, обычные ключи и колонка порядка по умолчанию.
+
+    Считается один раз и здесь: и SQL, и контракт обязаны понимать одинаково,
+    по чему выборка упорядочена, когда ни один флаг не выставлен.
+    """
+
+    optional: tuple[str, ...] = ()
+    plain: tuple[str, ...] = ()
+    # Ветка `ELSE`, она же порядок по умолчанию. `None` — сортировки нет вовсе.
+    default: str | None = None
+
+
+@dataclass(frozen=True)
 class Param:
     """Параметр готового запроса: имя, приведение типа из SQL, обязательность."""
 
@@ -162,12 +195,18 @@ def params(sql: str) -> list[Param]:
     написанного руками (`... WHERE u.external_id = @external_id`), и из
     `custom_query` — в настройках его тогда нет вовсе, а в вызове он есть.
     """
+    def cast(group: str) -> str | None:
+        # Тип может быть из двух слов (`double precision`), поэтому в шаблоне
+        # разрешён пробел — и вместе с ним прилипает пробел перед `=`.
+        written = (match.group(group) or "").strip()
+        return written or None
+
     found: dict[str, Param] = {}
     for match in _PARAM.finditer(sql):
         if match.group("named"):
-            param = Param(match.group("named"), match.group("cast"))
+            param = Param(match.group("named"), cast("cast"))
         else:
-            param = Param(match.group("narg"), match.group("narg_cast"), optional=True)
+            param = Param(match.group("narg"), cast("narg_cast"), optional=True)
         # Первое вхождение задаёт тип: дальше тот же параметр повторяется без
         # приведения — `sqlc.narg('x')::bool IS NULL OR col = sqlc.narg('x')`.
         found.setdefault(param.name, param)
@@ -335,13 +374,19 @@ def _read_sql(
         )
 
     if shown:
-        body = ["SELECT", "    " + ",\n    ".join(ident(column) for column in shown)]
+        body = [
+            "SELECT",
+            "    " + ",\n    ".join(field(table, column) for column in shown),
+        ]
     else:
         body = ["SELECT *"]
 
     where = _where_block(entry, table, EXACT_WHERE_KEY)
     body.append(f"FROM {ident(table.name)}")
     body += where
+    # Сортировка идёт после условий и до постраничности — иначе Postgres не
+    # примет запрос, а страницы резались бы до упорядочивания.
+    body += _order_block(entry, table, name, problems, always=annotation == "many")
 
     if annotation == "one":
         body.append("LIMIT 1")
@@ -450,6 +495,98 @@ def _value(written: str | None, column: str) -> str:
     return written or f"@{column}"
 
 
+def field(table: Table, column: str) -> str:
+    """Колонка с именем таблицы: `"user".id`, `alias.name`.
+
+    Имя берём короткое, без схемы: в `FROM dc."user"` таблица видна именно как
+    `"user"`. Схема в ссылке тоже допустима, но короче читается.
+
+    Годится не везде: `INSERT` перечисляет свои колонки без имени таблицы, а
+    `UPDATE ... SET` требует того же — там квалификация синтаксическая ошибка.
+    """
+    return f"{ident(table.short_name)}.{ident(column)}"
+
+
+def ordering(entry: dict, table: Table, *, always: bool) -> Ordering:
+    """Что и в каком порядке сортирует выборка. Правило одно на SQL и контракт."""
+    columns = entry.get(COLUMNS_KEY) or []
+    optional = tuple(
+        col[COLUMN_NAME_KEY] for col in columns if col.get(ORDER_BY_OPTIONAL_KEY)
+    )
+    plain = tuple(col[COLUMN_NAME_KEY] for col in columns if col.get(ORDER_BY_KEY))
+
+    if not optional and not plain:
+        # У выборки списка порядок обязателен: без него постраничность начинает
+        # повторять и терять строки. Берём первую колонку DDL.
+        if not always:
+            return Ordering()
+        plain = (table.columns[0].name,)
+
+    return Ordering(optional, plain, plain[0] if plain else table.columns[0].name)
+
+
+def _order_block(
+    entry: dict, table: Table, query: str, problems: list[Problem], *, always: bool
+) -> list[str]:
+    """Строки `ORDER BY ...`.
+
+    Необязательные колонки становятся булевыми параметрами и собираются в один
+    `CASE`: вызывающий включает нужную сортировку флагом. `ELSE` обязателен —
+    без него `CASE` вернул бы `NULL` и порядок пропал бы совсем; в него идёт
+    первая обычная колонка сортировки, а если таких нет — первая колонка DDL.
+
+    У выборки списка (`always`) порядок есть всегда, даже когда не отмечено
+    ничего: без `ORDER BY` Postgres волен вернуть строки в любом порядке, и
+    постраничная выборка начинает то повторять строки, то терять их.
+    """
+    order = ordering(entry, table, always=always)
+    if order.default is None:
+        return []
+
+    if not order.optional:
+        return ["ORDER BY " + ", ".join(field(table, column) for column in order.plain)]
+
+    optional, fallback = order.optional, order.default
+    _check_case_types(table, [*optional, fallback], query, problems)
+
+    lines = ["ORDER BY"]
+    for index, column in enumerate(optional):
+        # Выравнивание по первому WHEN: `CASE ` — ровно пять знаков.
+        head = "    CASE " if index == 0 else "         "
+        lines.append(
+            f"{head}WHEN {ORDER_PARAM}{column}{ORDER_PARAM_CAST} = true "
+            f"THEN {field(table, column)}"
+        )
+
+    # Остальные обычные колонки — дополнительными ключами после CASE.
+    tail = "".join(f", {field(table, column)}" for column in order.plain[1:])
+    lines.append(f"         ELSE {field(table, fallback)} END{tail}")
+    return lines
+
+
+def _check_case_types(
+    table: Table, columns: list[str], query: str, problems: list[Problem]
+) -> None:
+    """Ветки `CASE` обязаны быть одного типа — иначе Postgres отвергнет запрос."""
+    kinds: dict[str, str] = {}
+    for name in columns:
+        column = table.column(name)
+        if column is not None:
+            kinds.setdefault(column.sql_type, name)
+
+    if len(kinds) > 1:
+        listed = ", ".join(f"{name} {sql_type}" for sql_type, name in kinds.items())
+        problems.append(
+            Problem(
+                table.name,
+                query,
+                f"ORDER BY CASE смешивает типы ({listed}) — Postgres такой запрос "
+                "не выполнит",
+                fatal=False,
+            )
+        )
+
+
 def _where_block(entry: dict, table: Table, value_key: str) -> list[str]:
     """Строки `WHERE ...` / `  AND ...` — или пустой список, если условий нет."""
     conditions: list[str] = []
@@ -459,14 +596,16 @@ def _where_block(entry: dict, table: Table, value_key: str) -> list[str]:
         written = (col.get(value_key) or "").strip()
 
         if col.get(WHERE_KEY):
-            conditions.append(f"{ident(name)} = {written or f'@{name}'}")
+            conditions.append(f"{field(table, name)} = {written or f'@{name}'}")
         elif col.get(WHERE_OPTIONAL_KEY):
             # Необязательный фильтр: параметр либо задан, либо условие не работает.
             # Приведение типа нужно, чтобы sqlc не гадал тип sqlc.narg.
             param = written or f"sqlc.narg('{name}')"
             column = table.column(name)
             cast = f"::{column.sql_type}" if column is not None else ""
-            conditions.append(f"({param}{cast} IS NULL OR {ident(name)} = {param})")
+            conditions.append(
+                f"({param}{cast} IS NULL OR {field(table, name)} = {param})"
+            )
 
     custom = (entry.get(CUSTOM_WHERE_KEY) or "").strip()
     if custom:

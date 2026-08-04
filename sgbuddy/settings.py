@@ -21,9 +21,13 @@ DESCRIPTION = (
     "Программа перезаписывает файл целиком, когда сохраняет настройки."
 )
 
-# Порядок первых трёх ключей фиксирован: пояснение, папка схемы, .proto.
+# Порядок первых пяти ключей фиксирован: пояснение, папка схемы, .proto и две
+# его шапки — всё, что мастер спрашивает до разбора схемы. Ключи идут в том же
+# порядке, в каком строки лежат в сгенерированном файле.
 SCHEMA_FOLDER_KEY = "schema_folder_path"
 SAVE_PROTO_KEY = "save_proto_path"
+PROTO_PACKAGE_KEY = "proto_package"
+GO_PACKAGE_KEY = "go_package"
 
 # Раздел с запросами: CRUD -> таблица -> CREATE/READ/UPDATE/DELETE -> описания.
 CRUD_KEY = "CRUD"
@@ -43,6 +47,10 @@ WHERE_KEY = "where"
 WHERE_OPTIONAL_KEY = "where_optional"
 EXACT_WHERE_KEY = "exact_where"
 CUSTOM_WHERE_KEY = "custom_where"
+# Сортировка. Есть только у выборки списка: у `one` строка одна, порядок ей ни к
+# чему, — поэтому в колонках эти ключи появляются только при аннотации `many`.
+ORDER_BY_KEY = "order_by"
+ORDER_BY_OPTIONAL_KEY = "order_by_optional"
 # Своё тело запроса — есть у всех четырёх направлений.
 CUSTOM_QUERY_KEY = "custom_query"
 
@@ -114,28 +122,61 @@ def settings_path(folder: str | Path) -> Path:
     return Path(folder) / SETTINGS_FILENAME
 
 
-def default_settings(folder: str | Path, proto: str | Path) -> dict:
-    """Стандартные параметры нового файла — пояснение и два пути."""
+def windows_path(value: str | Path) -> str:
+    """Путь с обратными слэшами: `C:/dc/schema` -> `C:\\dc\\schema`.
+
+    Программа локальная и windows-овая, а путь из файла копируют в проводник и
+    в чужие конфиги. Введённый со слэшами он работает, но выглядит чужеродно
+    рядом с остальными, поэтому в файл кладём один вид разделителя.
+    """
+    return str(value).replace("/", "\\")
+
+
+def default_settings(
+    folder: str | Path,
+    proto: str | Path,
+    go_package: str = "",
+    proto_package: str = "",
+) -> dict:
+    """Стандартные параметры нового файла — пояснение, два пути и две шапки."""
     return {
         DESCRIPTION_KEY: DESCRIPTION,
-        SCHEMA_FOLDER_KEY: str(folder),
-        SAVE_PROTO_KEY: str(proto),
+        SCHEMA_FOLDER_KEY: windows_path(folder),
+        SAVE_PROTO_KEY: windows_path(proto),
+        PROTO_PACKAGE_KEY: proto_package,
+        GO_PACKAGE_KEY: go_package,
     }
 
 
-def with_paths(data: dict, folder: str | Path, proto: str | Path) -> dict:
-    """Возвращает настройки, где шапка и два путевых ключа стоят первыми.
+def with_paths(
+    data: dict,
+    folder: str | Path,
+    proto: str | Path,
+    go_package: str = "",
+    proto_package: str = "",
+) -> dict:
+    """Возвращает настройки, где шапка и выбранное в мастере стоят первыми.
 
-    Пути — то, что выбрано в интерфейсе сейчас; всё остальное из файла
-    сохраняется как есть. `description` переписывается нашим текстом: это
+    Пути и go-пакет — то, что выбрано в интерфейсе сейчас; всё остальное из
+    файла сохраняется как есть. `description` переписывается нашим текстом: это
     подпись программы, а не пользовательское поле.
     """
-    head = (DESCRIPTION_KEY, SCHEMA_FOLDER_KEY, SAVE_PROTO_KEY)
+    head = (
+        DESCRIPTION_KEY,
+        SCHEMA_FOLDER_KEY,
+        SAVE_PROTO_KEY,
+        PROTO_PACKAGE_KEY,
+        GO_PACKAGE_KEY,
+    )
     rest = {k: v for k, v in data.items() if k not in head}
     return {
         DESCRIPTION_KEY: DESCRIPTION,
-        SCHEMA_FOLDER_KEY: str(folder),
-        SAVE_PROTO_KEY: str(proto),
+        SCHEMA_FOLDER_KEY: windows_path(folder),
+        SAVE_PROTO_KEY: windows_path(proto),
+        PROTO_PACKAGE_KEY: proto_package,
+        # Пакеты через `windows_path` не пропускаем: это имя пакета и путь
+        # импорта Go, а не файловые пути, и точки со слэшами в них — значение.
+        GO_PACKAGE_KEY: go_package,
         **rest,
     }
 

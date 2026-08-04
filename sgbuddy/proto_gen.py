@@ -3,6 +3,9 @@
 Контракт описывает те же запросы, что и `query.sql`, поэтому правила перевода
 привязаны к собранному SQL, а не к настройкам напрямую:
 
+* `package` и `option go_package` — то, что спросил мастер и записал в
+  `schema.json`; из имени схемы Postgres они не выводятся. Нет ответа — нет и
+  строки: пустыми они файл сломают;
 * на таблицу — сообщение со всеми её колонками: это строка, какой её вернёт
   `SELECT *` и `RETURNING *`;
 * на запрос — пара сообщений `<Имя>Request`/`<Имя>Response` и метод в сервисе
@@ -10,6 +13,10 @@
 * поля запроса — параметры **готового SQL** в порядке появления. Читаем их из
   запроса, а не из настроек: параметр приходит и из значения, написанного руками
   (`... WHERE u.external_id = @external_id`), и из `custom_query`;
+* тип параметра ищется по порядку: колонка своей таблицы, приведение из SQL
+  (`@id::uuid`), колонка того же имени в других таблицах схемы — параметр часто
+  приходит из подзапроса по соседней таблице. Не нашлось нигде — `string`
+  и строка в проблемах;
 * необязательный фильтр (`sqlc.narg`) и колонка, допускающая `NULL`, дают
   `optional`-поле;
 * ответ зависит от аннотации: `exec` — пустое сообщение, `one` — одна строка,
@@ -19,7 +26,15 @@
   `Count<имя>`. Имена совпадают с параметрами SQL, чтобы контракт и запрос
   читались как одно целое;
 * выборка с явным списком колонок получает своё сообщение строки `<Имя>Row` —
-  в ответе должно быть видно ровно то, что выгружается, а не вся таблица.
+  в ответе должно быть видно ровно то, что выгружается, а не вся таблица;
+* сортировка: необязательные колонки приходят готовыми параметрами
+  `order_by_<колонка>` типа `bool` — у них в SQL написано приведение. Генератор
+  добавляет к ним строку, по какой колонке флаг упорядочивает, и называет в
+  шапке запроса порядок по умолчанию: обычные колонки сортировки параметрами не
+  становятся, и по полям их не видно;
+* над каждым сообщением — строка-комментарий: что за запрос и что в сообщении
+  лежит. По имени `GetAliasesRow` этого не видно, а контракт читают чаще, чем
+  настройки, из которых он собран.
 
 Запрос, который не собрался в SQL, не попадает и в контракт: причина та же и
 формулирует её генератор SQL. Файл перезаписывается целиком.
@@ -40,13 +55,16 @@ from .settings import (
     COLUMNS_KEY,
     CRUD_KEY,
     DIRECTIONS,
+    GO_PACKAGE_KEY,
+    PROTO_PACKAGE_KEY,
+    MODE_KEY,
     NAME_KEY,
     PAGINATION_KEY,
     SHOW_KEY,
 )
 
 HEADER = (
-    "// Файл сгенерирован программой SG Buddy.",
+    "// Файл сгенерирован программой SG Buddy https://github.com/konstantin-suspitsyn/sg_buddy",
     "// Правки будут затёрты при следующей генерации: правьте настройки, а не этот файл.",
 )
 
@@ -56,9 +74,6 @@ _TABLE_RULE = "// " + "=" * 57
 SYNTAX = 'syntax = "proto3";'
 TIMESTAMP = "google.protobuf.Timestamp"
 TIMESTAMP_IMPORT = 'import "google/protobuf/timestamp.proto";'
-
-# Пакет, если у таблиц нет схемы: `package ;` не бывает.
-FALLBACK_PACKAGE = "api"
 
 # Постраничность. Имена те же, что у параметров SQL и колонок счётчика.
 PAGE_PARAMS = ("page_limit", "page_offset")
@@ -106,6 +121,19 @@ _TYPES = (
 
 _WORD = re.compile(r"[^0-9A-Za-z]+")
 
+# Чем запрос является — для строки над сообщением. Удаление ещё и по режиму:
+# мягкое и обратное — не то же самое, что физическое.
+_KINDS = {
+    "CREATE": "Вставка",
+    "READ": "Выборка",
+    "UPDATE": "Изменение",
+    "DELETE": "Удаление",
+}
+_DELETE_KINDS = {
+    query_gen.SOFT_DELETE: "Мягкое удаление",
+    query_gen.UNDELETE: "Обратное удаление",
+}
+
 
 @dataclass
 class _Field:
@@ -115,6 +143,9 @@ class _Field:
     name: str
     repeated: bool = False
     optional: bool = False
+    # Строка над полем. Нужна там, где имени мало: флаг сортировки сам по себе
+    # не говорит, по какой колонке он упорядочит выборку.
+    comment: str | None = None
 
 
 @dataclass
@@ -131,9 +162,9 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
     by_name = {table.name: table for table in tables}
     problems: list[Problem] = []
     taken = query_gen.query_names(settings)
+    index = _column_index(tables)
 
     sections: list[str] = []
-    schemas: list[str] = []
 
     for table_name, directions in (settings.get(CRUD_KEY) or {}).items():
         table = by_name.get(table_name)
@@ -147,19 +178,31 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
             result
             for direction in DIRECTIONS
             for entry in directions.get(direction) or []
-            if (result := _entry(direction, entry, table, taken, problems)) is not None
+            if (result := _entry(direction, entry, table, taken, index, problems))
+            is not None
         ]
         if not built:
             continue
 
-        schemas.append(table_name.split(".")[0] if "." in table_name else "")
         sections.append(_section(table, built, problems))
 
     if not sections:
         raise GenerationError("в настройках нет ни одного запроса")
 
     body = "\n\n".join(sections)
-    head = [*HEADER, "", SYNTAX, "", f"package {_package(schemas, problems)};"]
+    head = [*HEADER, "", SYNTAX]
+
+    # Обе шапки спрашивает мастер и по имени схемы не выводит. В старых
+    # настройках их нет — тогда нет и строк: пустые `package ;` и
+    # `option go_package = ""` protoc не примет.
+    proto_package = (settings.get(PROTO_PACKAGE_KEY) or "").strip()
+    if proto_package:
+        head += ["", f"package {proto_package};"]
+
+    go_package = (settings.get(GO_PACKAGE_KEY) or "").strip()
+    if go_package:
+        head += ["", f'option go_package = "{go_package}";']
+
     if TIMESTAMP in body:
         head += ["", TIMESTAMP_IMPORT]
 
@@ -184,7 +227,12 @@ def generate(
 
 
 def _entry(
-    direction: str, entry: dict, table: Table, taken: set[str], problems: list[Problem]
+    direction: str,
+    entry: dict,
+    table: Table,
+    taken: set[str],
+    index: dict[str, list[tuple[str, Column]]],
+    problems: list[Problem],
 ) -> _Built | None:
     """Сообщения и метод одного запроса. `None` — запрос не собрался в SQL."""
     name = (entry.get(NAME_KEY) or "").strip()
@@ -202,14 +250,24 @@ def _entry(
     ).strip()
     paged = bool(entry.get(PAGINATION_KEY)) and direction == "READ" and annotation == "many"
 
-    request = _request(sql, table, name, paged, problems)
-    row_type, row_message, uses_row = _row(direction, entry, table, name, annotation, problems)
+    kind = _kind(direction, entry)
+    # Сортировку спрашиваем у генератора SQL: правило `ELSE` — его, и контракт
+    # обязан называть ту же колонку, что запрос.
+    order = query_gen.ordering(entry, table, always=direction == "READ" and annotation == "many")
+    request = _request(sql, table, name, paged, index, order, problems)
+    row_type, row_message, uses_row = _row(
+        direction, entry, table, name, annotation, kind, problems
+    )
     response = _response(row_type, table, annotation, paged)
 
-    messages = [_message(f"{name}Request", request)]
+    messages = [
+        _message(f"{name}Request", request, _request_comment(kind, name, order))
+    ]
     if row_message is not None:
         messages.append(row_message)
-    messages.append(_message(f"{name}Response", response))
+    messages.append(
+        _message(f"{name}Response", response, _response_comment(kind, name, annotation, paged))
+    )
 
     return _Built(
         messages=messages,
@@ -219,10 +277,19 @@ def _entry(
 
 
 def _request(
-    sql: str, table: Table, query: str, paged: bool, problems: list[Problem]
+    sql: str,
+    table: Table,
+    query: str,
+    paged: bool,
+    index: dict[str, list[tuple[str, Column]]],
+    order: query_gen.Ordering,
+    problems: list[Problem],
 ) -> list[_Field]:
     """Поля запроса: параметры SQL, а следом — постраничность."""
     fields: list[_Field] = []
+    # Флаг сортировки приходит обычным параметром `@order_by_<колонка>::boolean`,
+    # то есть тип у него уже есть. Здесь нужно только сказать, что он делает.
+    flags = {_order_flag(column): column for column in order.optional}
 
     for param in query_gen.params(sql):
         # Постраничность добавляем сами и всегда парой: в SQL те же параметры
@@ -230,30 +297,105 @@ def _request(
         if param.name in PAGE_PARAMS:
             continue
 
-        column = table.column(param.name)
-        if column is not None:
-            proto = _column_type(column, table.name, query, problems)
-            optional = param.optional or column.nullable
-        else:
-            proto = _proto_type(param.cast or "")
-            if proto is None:
-                problems.append(
-                    Problem(
-                        table.name,
-                        query,
-                        f"параметр @{param.name} — не колонка таблицы и без приведения "
-                        "типа: поле объявлено string",
-                        fatal=False,
-                    )
-                )
-                proto = "string"
-            optional = param.optional
-
-        fields.append(_Field(proto, param.name, optional=optional and proto != TIMESTAMP))
+        proto, optional = _param_type(param, table, query, index, problems)
+        sorted_by = flags.get(param.name)
+        fields.append(
+            _Field(
+                proto,
+                param.name,
+                optional=optional and proto != TIMESTAMP,
+                comment=f"true — упорядочить по {sorted_by}" if sorted_by else None,
+            )
+        )
 
     if paged:
         fields += [_Field(proto, name) for proto, name in PAGE_REQUEST]
     return fields
+
+
+def _param_type(
+    param: query_gen.Param,
+    table: Table,
+    query: str,
+    index: dict[str, list[tuple[str, Column]]],
+    problems: list[Problem],
+) -> tuple[str, bool]:
+    """Тип параметра и признак `optional`.
+
+    Порядок источников: своя колонка, потом приведение, написанное в SQL, потом
+    колонка того же имени в других таблицах схемы. Приведение выше чужой колонки
+    намеренно: его автор написал руками именно про этот параметр, а совпадение
+    имён — всего лишь догадка.
+    """
+    column = table.column(param.name)
+    if column is not None:
+        return _column_type(column, table.name, query, problems), (
+            param.optional or column.nullable
+        )
+
+    cast = _proto_type(param.cast or "")
+    if cast is not None:
+        return cast, param.optional
+
+    foreign = _foreign_column(param.name, table.name, query, index, problems)
+    if foreign is not None:
+        # Обязательность берём от параметра, а не от чужой колонки: `NULL` там
+        # говорит про хранение в той таблице, а не про этот вызов.
+        return _column_type(foreign, table.name, query, problems), param.optional
+
+    problems.append(
+        Problem(
+            table.name,
+            query,
+            f"параметр @{param.name} не нашёлся ни в одной таблице схемы и написан "
+            "без приведения типа: поле объявлено string",
+            fatal=False,
+        )
+    )
+    return "string", param.optional
+
+
+def _foreign_column(
+    name: str,
+    own_table: str,
+    query: str,
+    index: dict[str, list[tuple[str, Column]]],
+    problems: list[Problem],
+) -> Column | None:
+    """Колонка того же имени в другой таблице схемы.
+
+    Параметр часто приходит из подзапроса по соседней таблице
+    (`... WHERE u.external_id = @external_id`): там имя колонки и есть имя
+    параметра, и тип честнее взять оттуда, чем объявлять поле строкой.
+    """
+    found = [(owner, column) for owner, column in index.get(name, []) if owner != own_table]
+    if not found:
+        return None
+
+    kinds = {_proto_type(column.sql_type) or "string" for _, column in found}
+    if len(kinds) > 1:
+        # Одно имя с разными типами в разных таблицах — угадать нельзя, но и
+        # молчать нельзя: берём первую по порядку схемы и говорим об этом.
+        where = ", ".join(f"{owner}.{column.name}" for owner, column in found)
+        problems.append(
+            Problem(
+                own_table,
+                query,
+                f"параметр @{name} есть в разных таблицах с разными типами ({where}) — "
+                f"тип взят из {found[0][0]}",
+                fatal=False,
+            )
+        )
+    return found[0][1]
+
+
+def _column_index(tables: list[Table]) -> dict[str, list[tuple[str, Column]]]:
+    """Колонки всей схемы по имени: `external_id` -> [(`dc.user`, Column)]."""
+    index: dict[str, list[tuple[str, Column]]] = {}
+    for table in tables:
+        for column in table.columns:
+            index.setdefault(column.name, []).append((table.name, column))
+    return index
 
 
 def _row(
@@ -262,6 +404,7 @@ def _row(
     table: Table,
     query: str,
     annotation: str,
+    kind: str,
     problems: list[Problem],
 ) -> tuple[str | None, str | None, bool]:
     """Тип строки ответа: имя сообщения, своё сообщение строки и нужна ли таблица.
@@ -288,7 +431,8 @@ def _row(
     fields = [
         _column_field(table.column(name), table.name, query, problems) for name in shown
     ]
-    return f"{query}Row", _message(f"{query}Row", fields), False
+    comment = f"{kind} {query}: строка ответа — только отмеченные колонки."
+    return f"{query}Row", _message(f"{query}Row", fields, comment), False
 
 
 def _response(
@@ -306,6 +450,42 @@ def _response(
     if paged:
         fields += [_Field(proto, name) for proto, name in PAGE_RESPONSE]
     return fields
+
+
+def _kind(direction: str, entry: dict) -> str:
+    """Чем запрос является, по-русски: «Выборка», «Мягкое удаление»."""
+    if direction == "DELETE":
+        return _DELETE_KINDS.get(entry.get(MODE_KEY) or "", _KINDS["DELETE"])
+    return _KINDS[direction]
+
+
+def _order_flag(column: str) -> str:
+    """Имя параметра-флага у колонки: то же, что печатает генератор SQL."""
+    return query_gen.ORDER_PARAM.lstrip("@") + column
+
+
+def _request_comment(kind: str, query: str, order: query_gen.Ordering) -> str:
+    """Строка над `<Имя>Request`. Порядок называем: по полям его не видно.
+
+    Обычные колонки сортировки параметрами не становятся — они зашиты в запрос,
+    и без этой строки вызывающий не узнает, в каком порядке придут строки.
+    """
+    if order.default is None:
+        return f"{kind} {query}: параметры вызова."
+
+    keys = ", ".join(order.plain) or order.default
+    return f"{kind} {query}: параметры вызова. Порядок по умолчанию — {keys}."
+
+
+def _response_comment(kind: str, query: str, annotation: str, paged: bool) -> str:
+    """Строка над `<Имя>Response` — что в ответе лежит на самом деле."""
+    if paged:
+        return f"{kind} {query}: страница строк и счётчики всей выборки."
+    if annotation == "many":
+        return f"{kind} {query}: все найденные строки."
+    if annotation == "one":
+        return f"{kind} {query}: одна строка."
+    return f"{kind} {query}: ответ пустой — запрос ничего не возвращает."
 
 
 def _returns_row(direction: str, annotation: str) -> bool:
@@ -330,7 +510,13 @@ def _section(table: Table, built: list[_Built], problems: list[Problem]) -> str:
             _column_field(column, table.name, table.short_name, problems)
             for column in table.columns
         ]
-        parts.append(_message(_camel(table.short_name), fields))
+        parts.append(
+            _message(
+                _camel(table.short_name),
+                fields,
+                f"Строка таблицы {table.name}: все колонки, как их вернёт SELECT *.",
+            )
+        )
         parts.append("")
 
     for item in built:
@@ -346,13 +532,19 @@ def _section(table: Table, built: list[_Built], problems: list[Problem]) -> str:
     return "\n".join(parts)
 
 
-def _message(name: str, fields: list[_Field]) -> str:
-    """Сообщение с полями по порядку. Номера — от единицы, без пропусков."""
-    if not fields:
-        return f"message {name} {{}}"
+def _message(name: str, fields: list[_Field], comment: str) -> str:
+    """Сообщение с полями по порядку. Номера — от единицы, без пропусков.
 
-    lines = [f"message {name} {{"]
+    Над каждым сообщением строка-комментарий: по имени `GetAliasesRow` не
+    видно, чей он и что в нём, а контракт читают чаще, чем настройки.
+    """
+    if not fields:
+        return f"// {comment}\nmessage {name} {{}}"
+
+    lines = [f"// {comment}", f"message {name} {{"]
     for number, item in enumerate(fields, start=1):
+        if item.comment:
+            lines.append(f"  // {item.comment}")
         prefix = "repeated " if item.repeated else "optional " if item.optional else ""
         lines.append(f"  {prefix}{item.type} {item.name} = {number};")
     lines.append("}")
@@ -391,23 +583,6 @@ def _proto_type(sql_type: str) -> str | None:
         if lowered.startswith(prefix):
             return proto
     return None
-
-
-def _package(schemas: list[str], problems: list[Problem]) -> str:
-    """Пакет — схема таблиц. Разные схемы в одном файле — повод сказать вслух."""
-    named = sorted({schema for schema in schemas if schema})
-    if not named:
-        return FALLBACK_PACKAGE
-    if len(named) > 1:
-        problems.append(
-            Problem(
-                ", ".join(named),
-                "—",
-                f"таблицы из разных схем — package взят по первой: {named[0]}",
-                fatal=False,
-            )
-        )
-    return named[0]
 
 
 def _camel(name: str) -> str:

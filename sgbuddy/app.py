@@ -25,6 +25,8 @@ from .proto_gen import generate as generate_proto
 from .query_gen import QUERY_FILENAME, GenerationError, default_query_path, generate
 from .settings import (
     ANNOTATION_KEY,
+    GO_PACKAGE_KEY,
+    PROTO_PACKAGE_KEY,
     COLUMN_NAME_KEY,
     COLUMN_VALUE_KEY,
     COLUMNS_KEY,
@@ -34,6 +36,8 @@ from .settings import (
     EXACT_WHERE_KEY,
     MODE_KEY,
     NAME_KEY,
+    ORDER_BY_KEY,
+    ORDER_BY_OPTIONAL_KEY,
     PAGINATION_KEY,
     SAVE_PROTO_KEY,
     SET_KEY,
@@ -202,10 +206,14 @@ STYLES = """
   .nicegui-content {
     padding: 24px 0 40px;
   }
+  /* В макете полоса была 1240px с отступами 56px, но туда не влезала таблица
+     полей выборки: с колонками сортировки ей нужно 782px, а оставалось 712.
+     1360 и отступы 32px дают запас и на широком окне, и на 1280px — там ширину
+     задаёт само окно, и `max-width` уже ничем не помогает. */
   .container {
-    max-width: 1240px;
+    max-width: 1360px;
     margin: 0 auto;
-    padding: 0 56px;
+    padding: 0 32px;
     width: 100%;
   }
   .eyebrow {
@@ -383,6 +391,13 @@ STYLES = """
   .grid-head.read-grid, .grid-row.read-grid {
     grid-template-columns: minmax(130px, 1.2fr) 84px 140px 130px minmax(150px, 1fr);
   }
+  /* То же плюс две колонки сортировки — у выборки списка. Ширины ужаты: семь
+     колонок в ту же ширину карточки иначе не помещаются. */
+  .grid-head.read-order-grid, .grid-row.read-order-grid {
+    grid-template-columns:
+      minmax(120px, 1.1fr) 66px 108px 118px minmax(120px, 1fr) 74px 128px;
+    gap: 8px;
+  }
   /* Четыре колонки физического удаления: поля, WHERE, optional, значение. */
   .grid-head.delete-grid, .grid-row.delete-grid {
     grid-template-columns: minmax(140px, 1.2fr) 80px 140px minmax(150px, 1fr);
@@ -453,8 +468,15 @@ class Workspace:
 
     proto: Path | None = None
     proto_error: str | None = None
-    # Путь к .proto из schema.json, который уже лежал в выбранной папке.
+    # Шапка будущего .proto — спрашиваем сразу за путём к файлу.
+    go_package: str | None = None
+    go_package_error: str | None = None
+    proto_package: str | None = None
+    proto_package_error: str | None = None
+    # Что уже лежало в schema.json выбранной папки: путь и обе шапки.
     saved_proto: Path | None = None
+    saved_go_package: str | None = None
+    saved_proto_package: str | None = None
 
     tables: list[Table] | None = None
     settings: dict | None = None
@@ -533,30 +555,40 @@ def _validate_folder(raw: str | None) -> str:
 
     workspace.folder = path
     workspace.schema = schema
-    workspace.saved_proto = _saved_proto_path(path)
+    (
+        workspace.saved_proto,
+        workspace.saved_go_package,
+        workspace.saved_proto_package,
+    ) = _saved_choices(path)
     return ""
 
 
-def _saved_proto_path(folder: Path) -> Path | None:
-    """Путь к `.proto` из уже лежащего в папке `schema.json`, если он там есть.
+def _saved_choices(folder: Path) -> tuple[Path | None, str | None, str | None]:
+    """Ответы мастера из уже лежащего в папке `schema.json`.
 
-    Файл почти всегда остался от прошлого запуска на этой же схеме, и прежний
-    путь — лучшая подсказка, чем имя по умолчанию. Читаем мягко: битый или
-    чужой файл на выборе папки спотыкаться не должен, его разберёт шаг 3.
+    Файл почти всегда остался от прошлого запуска на этой же схеме, и прежние
+    ответы — лучшая подсказка, чем умолчания. Читаем мягко: битый или чужой
+    файл на выборе папки спотыкаться не должен, его разберёт шаг 3.
     """
     path = settings_path(folder)
     if not path.is_file():
-        return None
+        return None, None, None
 
     try:
         data = load_settings(path)
     except (OSError, ValueError):
-        return None
+        return None, None, None
 
-    saved = data.get(SAVE_PROTO_KEY)
-    if not isinstance(saved, str) or not saved.strip():
-        return None
-    return Path(saved.strip())
+    def written(key: str) -> str | None:
+        value = data.get(key)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    proto = written(SAVE_PROTO_KEY)
+    return (
+        Path(proto) if proto else None,
+        written(GO_PACKAGE_KEY),
+        written(PROTO_PACKAGE_KEY),
+    )
 
 
 # «Другая папка» — тот же сброс: путь к .proto от прежней схемы почти наверняка
@@ -621,10 +653,10 @@ def default_proto_path() -> Path:
 
 
 def choose_proto(raw: str | None) -> None:
+    # Разбор схемы ждёт go-пакета: он пишется в те же настройки, и заводить их
+    # дважды — сначала без него, потом с ним — незачем.
     workspace.proto = None
     workspace.proto_error = _validate_proto(raw) or None
-    if workspace.proto is not None:
-        prepare()
     wizard.refresh()
 
 
@@ -721,14 +753,188 @@ def _proto_chosen() -> None:
         ui.label("файла ещё нет — создадим при генерации").classes("hint q-mt-xs")
 
 
+# --------------------------------------------------------- шаг 2: go-пакет
+
+
+def choose_go_package(raw: str | None) -> None:
+    workspace.go_package = None
+    workspace.go_package_error = _validate_go_package(raw) or None
+    wizard.refresh()
+
+
+def _validate_go_package(raw: str | None) -> str:
+    text = (raw or "").strip().strip('"')
+    if not text:
+        return "укажите go-пакет"
+    # Значение идёт в `option go_package = "..."` как есть, поэтому пробелы и
+    # кавычки внутри — это сломанный .proto, а не наша вольная трактовка.
+    if any(ch.isspace() for ch in text) or '"' in text:
+        return "в go-пакете не бывает пробелов и кавычек"
+
+    workspace.go_package = text
+    return ""
+
+
+def _forget_go_package() -> None:
+    workspace.go_package = None
+    workspace.go_package_error = None
+    # Настройки уже завелись на прошлых ответах — сбрасываем и разбор схемы,
+    # иначе слева остался бы список таблиц от неподтверждённого шага.
+    workspace.tables = None
+    wizard.refresh()
+
+
+def _go_package_card() -> None:
+    with ui.element("div").classes("card q-mt-md"):
+        if workspace.go_package is None:
+            _go_package_picker()
+        else:
+            _go_package_chosen()
+
+
+def _go_package_picker() -> None:
+    ui.label("go_package").classes("field-label")
+
+    with ui.row().classes("w-full items-center gap-3 no-wrap q-mt-xs"):
+        value_input = (
+            ui.input(
+                value=workspace.saved_go_package or "",
+                placeholder="github.com/org/repo/gen/pb;pb",
+            )
+            .props("outlined dense")
+            .classes("grow")
+        )
+        value_input.on("keydown.enter", lambda: choose_go_package(value_input.value))
+        ui.button(
+            "Указать", on_click=lambda: choose_go_package(value_input.value), color=None
+        ).props("unelevated no-caps").classes("btn-primary")
+
+    if workspace.saved_go_package:
+        ui.label(f"взят из {SETTINGS_FILENAME} — можно заменить").classes("hint q-mt-xs")
+    else:
+        ui.label(
+            "путь импорта для сгенерированного Go-кода: пойдёт в option go_package"
+        ).classes("hint q-mt-xs")
+
+    if workspace.go_package_error:
+        ui.label(workspace.go_package_error).classes("error-text q-mt-sm")
+
+
+def _go_package_chosen() -> None:
+    with ui.row().classes("w-full items-center gap-3 no-wrap"):
+        ui.label("go-пакет указан").classes("ok-badge")
+        ui.space()
+        ui.button(
+            "Изменить", on_click=_forget_go_package, color=None
+        ).props("flat no-caps").classes("btn-secondary")
+
+    ui.label(workspace.go_package).classes("path-line q-mt-sm")
+    ui.label('в .proto пойдёт option go_package = "…"').classes("hint q-mt-xs")
+
+
+# --------------------------------------------------------- шаг 2: package
+
+
+# Имя пакета протобуфа: слова через точку, каждое — как идентификатор.
+_PROTO_PACKAGE = re.compile(r"^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$")
+
+
+def default_proto_package() -> str:
+    """Подсказка: хвост go-пакета после `;` — там лежит имя пакета Go.
+
+    Совпадение не обязательно, но так их пишут чаще всего, и одним кликом
+    получается осмысленный ответ вместо пустого поля.
+    """
+    go = workspace.go_package or ""
+    if ";" in go:
+        return go.rsplit(";", 1)[1].strip()
+    return go.rsplit("/", 1)[-1].strip()
+
+
+def choose_proto_package(raw: str | None) -> None:
+    """Запоминает пакет и, если он годный, разбирает схему."""
+    workspace.proto_package = None
+    workspace.proto_package_error = _validate_proto_package(raw) or None
+    if workspace.proto_package is not None:
+        prepare()
+    wizard.refresh()
+
+
+def _validate_proto_package(raw: str | None) -> str:
+    text = (raw or "").strip().strip('"')
+    if not text:
+        return "укажите package"
+    if not _PROTO_PACKAGE.match(text):
+        return "package пишется словами через точку: api, dc.v1"
+
+    workspace.proto_package = text
+    return ""
+
+
+def _forget_proto_package() -> None:
+    workspace.proto_package = None
+    workspace.proto_package_error = None
+    workspace.tables = None
+    wizard.refresh()
+
+
+def _proto_package_card() -> None:
+    with ui.element("div").classes("card q-mt-md"):
+        if workspace.proto_package is None:
+            _proto_package_picker()
+        else:
+            _proto_package_chosen()
+
+
+def _proto_package_picker() -> None:
+    ui.label("package").classes("field-label")
+
+    suggested = workspace.saved_proto_package or default_proto_package()
+
+    with ui.row().classes("w-full items-center gap-3 no-wrap q-mt-xs"):
+        value_input = (
+            ui.input(value=suggested, placeholder="api.v1")
+            .props("outlined dense")
+            .classes("grow")
+        )
+        value_input.on("keydown.enter", lambda: choose_proto_package(value_input.value))
+        ui.button(
+            "Указать",
+            on_click=lambda: choose_proto_package(value_input.value),
+            color=None,
+        ).props("unelevated no-caps").classes("btn-primary")
+
+    if workspace.saved_proto_package:
+        ui.label(f"взят из {SETTINGS_FILENAME} — можно заменить").classes("hint q-mt-xs")
+    else:
+        ui.label("имя пакета протобуфа: пойдёт строкой package в .proto").classes(
+            "hint q-mt-xs"
+        )
+
+    if workspace.proto_package_error:
+        ui.label(workspace.proto_package_error).classes("error-text q-mt-sm")
+
+
+def _proto_package_chosen() -> None:
+    with ui.row().classes("w-full items-center gap-3 no-wrap"):
+        ui.label("package указан").classes("ok-badge")
+        ui.space()
+        ui.button(
+            "Изменить", on_click=_forget_proto_package, color=None
+        ).props("flat no-caps").classes("btn-secondary")
+
+    ui.label(workspace.proto_package).classes("path-line q-mt-sm")
+    ui.label("в .proto пойдёт строкой package …;").classes("hint q-mt-xs")
+
+
 # ------------------------------------------------- шаг 3: schema.json и таблицы
 
 
 def prepare() -> None:
     """Заводит `schema.json` рядом со схемой и разбирает `schema.sql`.
 
-    Оба пути к этому моменту уже выбраны, так что шаг делается сам — ждать
-    от пользователя ещё одного клика не за что.
+    Всё, что спрашивает мастер, к этому моменту уже выбрано, так что шаг
+    делается сам — ждать от пользователя ещё одного клика не за что.
     """
     workspace.prepare_error = None
 
@@ -741,9 +947,15 @@ def prepare() -> None:
     path = settings_path(workspace.folder)
     try:
         created = not path.is_file()
-        data = default_settings(workspace.folder, workspace.proto) if created else load_settings(path)
-        # Пути в файле всегда отражают то, что выбрано сейчас, и стоят первыми.
-        data = with_paths(migrate_crud(data), workspace.folder, workspace.proto)
+        answers = (
+            workspace.folder,
+            workspace.proto,
+            workspace.go_package or "",
+            workspace.proto_package or "",
+        )
+        data = default_settings(*answers) if created else load_settings(path)
+        # Ответы мастера в файле всегда отражают выбранное сейчас и стоят первыми.
+        data = with_paths(migrate_crud(data), *answers)
         save_settings(data, path)
     except (OSError, ValueError) as err:
         workspace.prepare_error = f"{path}: {err}"
@@ -786,6 +998,8 @@ def _summary_card() -> None:
         rows = [
             ("схема", workspace.schema),
             (PROTO_SUFFIX, workspace.proto),
+            ("package", workspace.proto_package),
+            ("go_package", workspace.go_package),
             ("настройки", workspace.settings_file),
         ]
         if workspace.query_file is not None:
@@ -1306,6 +1520,10 @@ class ReadForm:
     where: set[str] = field(default_factory=set)
     where_optional: set[str] = field(default_factory=set)
     exact: dict[str, str] = field(default_factory=dict)
+    # Сортировка — только у `many`. По умолчанию не отмечена ни одна колонка:
+    # сортировать всю таблицу подряд никто не просил.
+    order_by: set[str] = field(default_factory=set)
+    order_by_optional: set[str] = field(default_factory=set)
     custom_where: str = ""
     custom_query: str = ""
     error: str | None = None
@@ -1341,23 +1559,29 @@ def _submit_read(table: Table) -> None:
         return
 
     entries = ensure_directions(workspace.settings, table.name)["READ"]
+    # Сортировка и постраничность бывают только у выборки списка.
+    many = draft.annotation == "many"
+
+    def column(col) -> dict:
+        described = {
+            COLUMN_NAME_KEY: col.name,
+            SHOW_KEY: col.name in draft.show,
+            WHERE_KEY: col.name in draft.where,
+            WHERE_OPTIONAL_KEY: col.name in draft.where_optional,
+            # Незаполненное поле — это null, а не пустая строка: генератору
+            # так видно, что значения нет, а не что оно пустое.
+            EXACT_WHERE_KEY: (draft.exact.get(col.name) or "").strip() or None,
+        }
+        if many:
+            described[ORDER_BY_KEY] = col.name in draft.order_by
+            described[ORDER_BY_OPTIONAL_KEY] = col.name in draft.order_by_optional
+        return described
+
     entry = {
         NAME_KEY: name,
         ANNOTATION_KEY: draft.annotation,
-        # Постраничность бывает только у выборки списка.
-        PAGINATION_KEY: draft.annotation == "many" and draft.pagination,
-        COLUMNS_KEY: [
-            {
-                COLUMN_NAME_KEY: col.name,
-                SHOW_KEY: col.name in draft.show,
-                WHERE_KEY: col.name in draft.where,
-                WHERE_OPTIONAL_KEY: col.name in draft.where_optional,
-                # Незаполненное поле — это null, а не пустая строка: генератору
-                # так видно, что значения нет, а не что оно пустое.
-                EXACT_WHERE_KEY: (draft.exact.get(col.name) or "").strip() or None,
-            }
-            for col in table.columns
-        ],
+        PAGINATION_KEY: many and draft.pagination,
+        COLUMNS_KEY: [column(col) for col in table.columns],
         CUSTOM_WHERE_KEY: (draft.custom_where or "").strip() or None,
         CUSTOM_QUERY_KEY: (draft.custom_query or "").strip() or None,
     }
@@ -1393,6 +1617,8 @@ def _edit_read(index: int, table: Table) -> None:
             for name, col in written.items()
             if col.get(EXACT_WHERE_KEY)
         },
+        order_by=flagged(ORDER_BY_KEY),
+        order_by_optional=flagged(ORDER_BY_OPTIONAL_KEY),
         custom_where=entry.get(CUSTOM_WHERE_KEY) or "",
         custom_query=entry.get(CUSTOM_QUERY_KEY) or "",
         editing=index,
@@ -1448,16 +1674,23 @@ def _read_form(table: Table) -> None:
                 on_change=lambda e: setattr(draft, "pagination", e.value),
             ).props("dense")
 
+    # Сортировка есть только у списка: у `one` строка одна, порядок ей ни к чему.
+    many = draft.annotation == "many"
+    grid = "read-order-grid" if many else "read-grid"
+
     ui.label("Поля").classes("field-label q-mt-md")
-    with ui.element("div").classes("grid-head read-grid q-mt-xs"):
+    with ui.element("div").classes(f"grid-head {grid} q-mt-xs"):
         ui.label("поля")
         ui.label("показать")
         ui.label("добавить в WHERE")
         ui.label("WHERE OPTIONAL")
         ui.label("EXACT WHERE")
+        if many:
+            ui.label("ORDER BY")
+            ui.label("ORDER BY OPTIONAL")
 
     for col in table.columns:
-        with ui.element("div").classes("grid-row read-grid"):
+        with ui.element("div").classes(f"grid-row {grid}"):
             with ui.column().classes("gap-0"):
                 ui.label(col.name).classes("table-name")
                 ui.label(col.sql_type).classes("hint")
@@ -1477,6 +1710,17 @@ def _read_form(table: Table) -> None:
                 value=draft.exact.get(col.name, ""),
                 on_change=lambda e, c=col.name: draft.exact.__setitem__(c, e.value),
             ).props("outlined dense")
+            if many:
+                ui.checkbox(
+                    value=col.name in draft.order_by,
+                    on_change=lambda e, c=col.name: toggle(draft.order_by, c, e.value),
+                ).props("dense")
+                ui.checkbox(
+                    value=col.name in draft.order_by_optional,
+                    on_change=lambda e, c=col.name: toggle(
+                        draft.order_by_optional, c, e.value
+                    ),
+                ).props("dense")
 
     ui.label("Custom WHERE").classes("field-label q-mt-md")
     ui.textarea(
@@ -1547,14 +1791,24 @@ def _read_list(table: Table) -> None:
                         color=None,
                     ).props("flat no-caps dense").classes("crud-btn danger")
 
-                for caption, value in (
+                lines = [
                     ("показать", names(SHOW_KEY)),
                     ("WHERE", names(WHERE_KEY)),
                     ("WHERE OPTIONAL", names(WHERE_OPTIONAL_KEY)),
                     ("EXACT WHERE", ", ".join(exact) or "—"),
+                ]
+                # Сортировка записана только у списка — у `one` этих строк нет.
+                if entry.get(ANNOTATION_KEY) == "many":
+                    lines += [
+                        ("ORDER BY", names(ORDER_BY_KEY)),
+                        ("ORDER BY OPTIONAL", names(ORDER_BY_OPTIONAL_KEY)),
+                    ]
+                lines += [
                     ("Custom WHERE", entry.get(CUSTOM_WHERE_KEY) or "—"),
                     ("Custom Query", entry.get(CUSTOM_QUERY_KEY) or "—"),
-                ):
+                ]
+
+                for caption, value in lines:
                     with ui.element("div").classes("record-row"):
                         ui.label(caption).classes("hint")
                         ui.label(value).classes("record-value")
@@ -2144,6 +2398,13 @@ def wizard() -> None:
         "генерации — править руками бессмысленно.",
     )
     _proto_card()
+
+    # Шапку .proto спрашиваем сразу за путём: без файла вопрос беспредметен,
+    # а package подсказывается по go-пакету, поэтому идёт следом за ним.
+    if workspace.proto is not None:
+        _go_package_card()
+    if workspace.go_package is not None:
+        _proto_package_card()
 
     if workspace.prepare_error:
         ui.label(workspace.prepare_error).classes("error-text q-mt-md")
