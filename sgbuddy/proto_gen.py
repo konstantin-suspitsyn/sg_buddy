@@ -317,8 +317,11 @@ def _request(
 
     for param in query_gen.params(sql):
         # Постраничность добавляем сами и всегда парой: в SQL те же параметры
-        # встречаются ещё и в счётчике, порядок там ни о чём не говорит.
-        if param.name in PAGE_PARAMS:
+        # встречаются ещё и в счётчике, порядок там ни о чём не говорит. Но
+        # имена `page`/`page_limit` зарезервированы только когда постраничность
+        # включена — иначе это может быть параметр из Custom WHERE, и его
+        # молча терять нельзя.
+        if paged and param.name in PAGE_PARAMS:
             continue
 
         proto, optional = _param_type(param, table, query, index, problems)

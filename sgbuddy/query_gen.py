@@ -206,10 +206,15 @@ def default_query_path(folder: str | Path) -> Path:
 # с зарезервированным словом Postgres (`order`): `@order` там, где sqlc
 # ожидает идентификатор, ловит `syntax error at or near "order"`, а
 # `sqlc.arg('order')` — нет, потому что имя внутри кавычек, не токен SQL.
+# У обеих функций sqlc принимает и имя без кавычек (`sqlc.arg(имя)`) — это
+# встречается в Custom WHERE, написанном руками, и должно читаться так же,
+# как форма с кавычками.
 _PARAM = re.compile(
     r"@(?P<named>[a-z_][a-z0-9_]*)(?:::(?P<cast>[a-z][a-z0-9_ ]*))?"
     r"|sqlc\.narg\('(?P<narg>[^']+)'\)(?:::(?P<narg_cast>[a-z][a-z0-9_ ]*))?"
+    r"|sqlc\.narg\((?P<narg_bare>[a-z_][a-z0-9_]*)\)(?:::(?P<narg_bare_cast>[a-z][a-z0-9_ ]*))?"
     r"|sqlc\.arg\('(?P<arg>[^']+)'\)(?:::(?P<arg_cast>[a-z][a-z0-9_ ]*))?"
+    r"|sqlc\.arg\((?P<arg_bare>[a-z_][a-z0-9_]*)\)(?:::(?P<arg_bare_cast>[a-z][a-z0-9_ ]*))?"
 )
 
 
@@ -232,8 +237,12 @@ def params(sql: str) -> list[Param]:
             param = Param(match.group("named"), cast("cast"))
         elif match.group("narg"):
             param = Param(match.group("narg"), cast("narg_cast"), optional=True)
-        else:
+        elif match.group("narg_bare"):
+            param = Param(match.group("narg_bare"), cast("narg_bare_cast"), optional=True)
+        elif match.group("arg"):
             param = Param(match.group("arg"), cast("arg_cast"))
+        else:
+            param = Param(match.group("arg_bare"), cast("arg_bare_cast"))
         # Первое вхождение задаёт тип: дальше тот же параметр повторяется без
         # приведения — `sqlc.narg('x')::bool IS NULL OR col = sqlc.narg('x')`.
         found.setdefault(param.name, param)
