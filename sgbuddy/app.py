@@ -91,6 +91,12 @@ CUSTOM_WHERE_HELP = (
     "то есть сужает выборку, а не заменяет её."
 )
 
+ORDER_BY_HELP = (
+    "«ORDER BY» — колонки сортируются всегда, в вызове их не выбирают. "
+    "«ORDER BY OPTIONAL» — колонка выбирается параметром order_by (её имя строкой), "
+    "направление у обеих групп общее — параметр order (ASC/DESC)."
+)
+
 # Текст — JetBrains Mono, заголовки — PT Sans. Обе подключены с Google Fonts,
 # за ними идёт web-safe цепочка: без интернета шрифт подменится, но вёрстка
 # останется той же — моноширинный к моноширинному, гротеск к гротеску.
@@ -278,9 +284,9 @@ STYLES = """
     padding: 0.625rem 1.75rem;
     font-weight: 600;
     font-size: 0.875rem;
-    /* Тень тёмно-фиолетовая, а не розовая из макета: под градиентом кнопки
+    /* Тень тёмно-бордовая, а не розовая из макета: под градиентом кнопки
        она читается как собственная тень, а не как второй цвет заливки. */
-    box-shadow: 0 10px 20px -6px rgba(76, 29, 149, 0.55);
+    box-shadow: 0 10px 20px -6px rgba(128, 0, 32, 0.55);
     transition: box-shadow 0.25s ease;
   }
   .btn-primary.q-btn:hover {
@@ -1026,6 +1032,8 @@ def _summary_card() -> None:
 
 def _generate_query() -> None:
     """Пишет query.sql рядом со схемой из того, что сейчас в настройках."""
+    if not _save_settings():
+        return
     try:
         path, problems = generate(
             workspace.settings, workspace.tables, default_query_path(workspace.folder)
@@ -1057,6 +1065,8 @@ def _generate_query() -> None:
 
 def _generate_proto() -> None:
     """Пишет .proto по выбранному на шаге 2 пути из того, что сейчас в настройках."""
+    if not _save_settings():
+        return
     try:
         path, problems = generate_proto(
             workspace.settings, workspace.tables, workspace.proto
@@ -1249,16 +1259,12 @@ def _detail() -> None:
 
         if workspace.selected_action == "Create":
             _created_list(table)
-            _finish_row()
         elif workspace.selected_action == "Read":
             _read_list(table)
-            _finish_row()
         elif workspace.selected_action == "Update":
             _update_list(table)
-            _finish_row()
         elif workspace.selected_action == "Delete":
             _delete_list(table)
-            _finish_row()
 
 
 # ---------------------------------------------------------------- форма Create
@@ -1386,13 +1392,14 @@ def _remove_create(index: int, table: Table) -> None:
     wizard.refresh()
 
 
-def _save_settings() -> None:
+def _save_settings() -> bool:
     try:
         save_settings(workspace.settings, workspace.settings_file)
     except OSError as err:
         ui.notify(f"не сохранилось: {err}", type="negative")
-        return
+        return False
     ui.notify(f"сохранено: {workspace.settings_file}", type="positive")
+    return True
 
 
 def _create_form(table: Table) -> None:
@@ -1721,6 +1728,9 @@ def _read_form(table: Table) -> None:
                         draft.order_by_optional, c, e.value
                     ),
                 ).props("dense")
+
+    if many:
+        ui.label(ORDER_BY_HELP).classes("hint q-mt-xs")
 
     ui.label("Custom WHERE").classes("field-label q-mt-md")
     ui.textarea(
@@ -2363,10 +2373,10 @@ def _delete_list(table: Table) -> None:
 
 
 def _finish_row() -> None:
-    with ui.row().classes("w-full justify-end"):
+    with ui.row().classes("w-full q-mt-md"):
         ui.button(
-            "Готово", on_click=_save_settings, color=None
-        ).props("unelevated no-caps").classes("btn-primary")
+            "Сохранить JSON", on_click=_save_settings, color=None
+        ).props("unelevated no-caps").classes("btn-primary w-full")
 
 
 # ---------------------------------------------------------------- шаги
@@ -2377,7 +2387,9 @@ def wizard() -> None:
     if workspace.tables is not None:
         _summary_card()
         with ui.row().classes("w-full no-wrap gap-4 q-mt-md items-start"):
-            _sidebar()
+            with ui.column().classes("gap-0"):
+                _sidebar()
+                _finish_row()
             _detail()
         return
 

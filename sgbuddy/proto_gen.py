@@ -22,16 +22,20 @@
 * ответ зависит от аннотации: `exec` — пустое сообщение, `one` — одна строка,
   `many` — `repeated`; у `DELETE` строки нет никогда;
 * **постраничность описывается целиком**: в запрос добавляются `page_limit` и
-  `page_offset`, в ответ — `total_rows` и `total_pages` из парного счётчика
-  `Count<имя>`. Имена совпадают с параметрами SQL, чтобы контракт и запрос
-  читались как одно целое;
+  `page` (номер страницы, `OFFSET` считается из него в SQL); строки постраничного
+  ответа лежат в поле `data` (не `rows`), а рядом — поле `pagination` сообщением
+  `Pagination` (одно на файл: `page`, `per_page`, `total_items`, `total_pages`).
+  `total_items`/`total_pages` берутся из парного счётчика `Count<имя>`;
 * выборка с явным списком колонок получает своё сообщение строки `<Имя>Row` —
   в ответе должно быть видно ровно то, что выгружается, а не вся таблица;
-* сортировка: необязательные колонки приходят готовыми параметрами
-  `order_by_<колонка>` типа `bool` — у них в SQL написано приведение. Генератор
-  добавляет к ним строку, по какой колонке флаг упорядочивает, и называет в
-  шапке запроса порядок по умолчанию: обычные колонки сортировки параметрами не
-  становятся, и по полям их не видно;
+* сортировка: выбираемая колонка и направление приходят готовыми параметрами
+  SQL — `order_by` и `order` (оба `string`), — тип берётся из приведения в
+  запросе, второй раз генератор его не выбирает. `order` принимает ровно
+  `ASC`/`DESC`, не `bool`: по имени параметра не видно, что значит `true`,
+  а по строке видно. Обоим полям генератор добавляет строку с
+  допустимыми значениями. Обычные колонки сортировки параметрами не
+  становятся и по полям не видны — шапка запроса называет порядок по
+  умолчанию;
 * над каждым сообщением — строка-комментарий: что за запрос и что в сообщении
   лежит. По имени `GetAliasesRow` этого не видно, а контракт читают чаще, чем
   настройки, из которых он собран.
@@ -75,10 +79,20 @@ SYNTAX = 'syntax = "proto3";'
 TIMESTAMP = "google.protobuf.Timestamp"
 TIMESTAMP_IMPORT = 'import "google/protobuf/timestamp.proto";'
 
-# Постраничность. Имена те же, что у параметров SQL и колонок счётчика.
-PAGE_PARAMS = ("page_limit", "page_offset")
-PAGE_REQUEST = (("int32", "page_limit"), ("int32", "page_offset"))
-PAGE_RESPONSE = (("int64", "total_rows"), ("int64", "total_pages"))
+# Постраничность в запросе. Имена те же, что у параметров SQL.
+PAGE_PARAMS = ("page_limit", "page")
+PAGE_REQUEST = (("int32", "page_limit"), ("int32", "page"))
+
+# Постраничность в ответе — одно сообщение на файл, а не пара счётчиков в
+# каждом Response: `page`/`per_page` в ответе дублируют то, что вызывающий
+# сам прислал в запросе, `total_items`/`total_pages` — из парного счётчика.
+PAGINATION_MESSAGE = "Pagination"
+PAGINATION_FIELDS = (
+    ("int32", "page"),
+    ("int32", "per_page"),
+    ("int64", "total_items"),
+    ("int64", "total_pages"),
+)
 
 # Postgres -> proto. Сопоставление по началу типа: `varchar(255)` и `varchar` —
 # одно и то же. Порядок важен: `integer` обязан проверяться раньше `int`.
@@ -155,6 +169,7 @@ class _Built:
     messages: list[str] = field(default_factory=list)
     rpc: str = ""
     uses_row: bool = False
+    uses_pagination: bool = False
 
 
 def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
@@ -165,6 +180,7 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
     index = _column_index(tables)
 
     sections: list[str] = []
+    uses_pagination = False
 
     for table_name, directions in (settings.get(CRUD_KEY) or {}).items():
         table = by_name.get(table_name)
@@ -184,10 +200,16 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
         if not built:
             continue
 
+        uses_pagination = uses_pagination or any(item.uses_pagination for item in built)
         sections.append(_section(table, built, problems))
 
     if not sections:
         raise GenerationError("в настройках нет ни одного запроса")
+
+    # Сообщение постраничности общее для всего файла, поэтому не в секции
+    # таблицы, а перед всеми ими — ровно один раз, если хоть кому-то нужно.
+    if uses_pagination:
+        sections.insert(0, _pagination_message())
 
     body = "\n\n".join(sections)
     head = [*HEADER, "", SYNTAX]
@@ -206,7 +228,9 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
     if TIMESTAMP in body:
         head += ["", TIMESTAMP_IMPORT]
 
-    return "\n".join([*head, "", body]), problems
+    # Перевод строки в конце — как в query.sql: файл без него ломает `git diff`
+    # и часть редакторов.
+    return "\n".join([*head, "", body]) + "\n", problems
 
 
 def generate(
@@ -238,11 +262,13 @@ def _entry(
     name = (entry.get(NAME_KEY) or "").strip()
 
     # Контракт описывает то, что реально уйдёт в базу, поэтому спрашиваем SQL у
-    # его генератора. Свои правила завели бы вторую версию тех же правил.
+    # его генератора. Свои правила завели бы вторую версию тех же правил — вместе
+    # с правилами и все проблемы: предупреждение вроде «постраничность без
+    # ORDER BY» относится и к .proto ровно так же, как к query.sql.
     sql_problems: list[Problem] = []
     sql = query_gen.entry_sql(direction, entry, table, taken, sql_problems)
+    problems.extend(sql_problems)
     if sql is None:
-        problems.extend(problem for problem in sql_problems if problem.fatal)
         return None
 
     annotation = (
@@ -273,6 +299,7 @@ def _entry(
         messages=messages,
         rpc=f"  rpc {name}({name}Request) returns ({name}Response);",
         uses_row=uses_row,
+        uses_pagination=paged,
     )
 
 
@@ -287,9 +314,6 @@ def _request(
 ) -> list[_Field]:
     """Поля запроса: параметры SQL, а следом — постраничность."""
     fields: list[_Field] = []
-    # Флаг сортировки приходит обычным параметром `@order_by_<колонка>::boolean`,
-    # то есть тип у него уже есть. Здесь нужно только сказать, что он делает.
-    flags = {_order_flag(column): column for column in order.optional}
 
     for param in query_gen.params(sql):
         # Постраничность добавляем сами и всегда парой: в SQL те же параметры
@@ -298,13 +322,20 @@ def _request(
             continue
 
         proto, optional = _param_type(param, table, query, index, problems)
-        sorted_by = flags.get(param.name)
+        # У полей выбора колонки и направления по имени не видно, что можно
+        # выбрать — это единственные параметры, которым нужна подсказка.
+        if param.name == "order_by" and order.optional:
+            comment = "допустимые значения: " + ", ".join(order.optional)
+        elif param.name == "order":
+            comment = f"допустимые значения: {query_gen.ASCENDING}, {query_gen.DESCENDING}"
+        else:
+            comment = None
         fields.append(
             _Field(
                 proto,
                 param.name,
                 optional=optional and proto != TIMESTAMP,
-                comment=f"true — упорядочить по {sorted_by}" if sorted_by else None,
+                comment=comment,
             )
         )
 
@@ -438,18 +469,31 @@ def _row(
 def _response(
     row_type: str | None, table: Table, annotation: str, paged: bool
 ) -> list[_Field]:
-    """Поля ответа: строки и, если запрос постраничный, счётчики."""
+    """Поля ответа: строки и, если запрос постраничный, объект пагинации.
+
+    У постраничного ответа строки лежат в `data`, а не в `rows` — так с ним
+    рядом однозначно читается `pagination`, тоже объектом, а не парой отдельных
+    счётчиков.
+    """
     fields: list[_Field] = []
 
     if row_type is not None:
         if annotation == "many":
-            fields.append(_Field(row_type, "rows", repeated=True))
+            fields.append(_Field(row_type, "data" if paged else "rows", repeated=True))
         else:
             fields.append(_Field(row_type, _snake(table.short_name)))
 
     if paged:
-        fields += [_Field(proto, name) for proto, name in PAGE_RESPONSE]
+        fields.append(_Field(PAGINATION_MESSAGE, "pagination"))
     return fields
+
+
+def _pagination_message() -> str:
+    """Сообщение `Pagination` — одно на файл, используют все постраничные ответы."""
+    fields = [_Field(proto, name) for proto, name in PAGINATION_FIELDS]
+    return _message(
+        PAGINATION_MESSAGE, fields, "Постраничность: одна на файл, поля одни и те же везде."
+    )
 
 
 def _kind(direction: str, entry: dict) -> str:
@@ -457,11 +501,6 @@ def _kind(direction: str, entry: dict) -> str:
     if direction == "DELETE":
         return _DELETE_KINDS.get(entry.get(MODE_KEY) or "", _KINDS["DELETE"])
     return _KINDS[direction]
-
-
-def _order_flag(column: str) -> str:
-    """Имя параметра-флага у колонки: то же, что печатает генератор SQL."""
-    return query_gen.ORDER_PARAM.lstrip("@") + column
 
 
 def _request_comment(kind: str, query: str, order: query_gen.Ordering) -> str:
@@ -480,7 +519,7 @@ def _request_comment(kind: str, query: str, order: query_gen.Ordering) -> str:
 def _response_comment(kind: str, query: str, annotation: str, paged: bool) -> str:
     """Строка над `<Имя>Response` — что в ответе лежит на самом деле."""
     if paged:
-        return f"{kind} {query}: страница строк и счётчики всей выборки."
+        return f"{kind} {query}: страница данных и пагинация."
     if annotation == "many":
         return f"{kind} {query}: все найденные строки."
     if annotation == "one":
@@ -502,34 +541,35 @@ def _returns_row(direction: str, annotation: str) -> bool:
 
 
 def _section(table: Table, built: list[_Built], problems: list[Problem]) -> str:
-    """Всё, что относится к одной таблице: шапка, сообщения и сервис."""
-    parts = [_TABLE_RULE, f"// {table.name}", _TABLE_RULE, ""]
+    """Всё, что относится к одной таблице: шапка, сервис и сообщения.
+
+    Сервис идёт первым: он — оглавление таблицы, по нему видно, какие запросы
+    вообще есть. Сообщения ниже читают, когда уже знают, что ищут.
+    """
+    blocks = [f"{_TABLE_RULE}\n// {table.name}\n{_TABLE_RULE}"]
+
+    service = [f"service {_camel(table.short_name)}Service {{"]
+    service += [item.rpc for item in built]
+    service.append("}")
+    blocks.append("\n".join(service))
 
     if any(item.uses_row for item in built):
         fields = [
             _column_field(column, table.name, table.short_name, problems)
             for column in table.columns
         ]
-        parts.append(
+        blocks.append(
             _message(
                 _camel(table.short_name),
                 fields,
                 f"Строка таблицы {table.name}: все колонки, как их вернёт SELECT *.",
             )
         )
-        parts.append("")
 
     for item in built:
-        for message in item.messages:
-            parts.append(message)
-            parts.append("")
+        blocks += item.messages
 
-    service = [f"service {_camel(table.short_name)}Service {{"]
-    service += [item.rpc for item in built]
-    service.append("}")
-    parts.append("\n".join(service))
-
-    return "\n".join(parts)
+    return "\n\n".join(blocks)
 
 
 def _message(name: str, fields: list[_Field], comment: str) -> str:

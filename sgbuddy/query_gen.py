@@ -7,7 +7,7 @@
   тех же кавычках, что в запросах, между двумя линейками; у таблицы, от которой
   ничего не собралось, шапки нет;
 * выборка с постраничностью получает парный запрос `Count<имя> :one` — те же
-  таблица и условия, а вместо колонок `total_rows` и `total_pages`; если такое
+  таблица и условия, а вместо колонок `total_items` и `total_pages`; если такое
   имя в файле уже занято, **файл не перезаписывается вовсе**: двойника sqlc не
   простит, а писать выборку без счётчика — молча менять смысл настроек;
 * аннотация запроса берётся из настроек; `one` для вставки и изменения означает
@@ -20,6 +20,10 @@
 * обязательный фильтр даёт `колонка = значение`, необязательный —
   `(значение IS NULL OR колонка = значение)` с приведением типа из DDL, чтобы
   sqlc понимал тип параметра;
+* `EXACT WHERE` в READ — самостоятельное условие: если колонка не отмечена ни
+  WHERE, ни WHERE OPTIONAL, но поле заполнено, оно всё равно даёт `колонка =
+  значение` через `AND`. Если же WHERE или WHERE OPTIONAL отмечены, `EXACT
+  WHERE` играет прежнюю роль — переопределяет значение внутри этого условия;
 * `custom_where` приклеивается к остальным условиям через `AND`;
 * сортировка: обычные колонки дают `ORDER BY кол1, кол2`, необязательные —
   булевы параметры `@order_by_<колонка>::boolean` в одном `CASE`, где вызывающий
@@ -89,23 +93,39 @@ SET_MODES = (SOFT_DELETE, UNDELETE)
 # Аннотация по умолчанию, если её нет в настройках (у DELETE её нет вовсе).
 DEFAULT_ANNOTATION = {"CREATE": "exec", "READ": "many", "UPDATE": "exec", "DELETE": "exec"}
 
-# Флаг необязательной сортировки: к имени колонки спереди. `@order_by_created_at`
-# читается сам по себе — по номеру («optional_1») понять ничего нельзя. Тип
-# пишем явно: sqlc вывел бы его и из сравнения с `true`, но такого столбца в
-# схеме нет, и генератору контракта тип взять больше неоткуда.
-ORDER_PARAM = "@order_by_"
-ORDER_PARAM_CAST = "::boolean"
+# Сортировка среди отмеченных колонок: одна выбирается именем (`@order_by`), а
+# не булевым флагом на каждую — иначе колонок-кандидатов больше, а выбрать
+# всё равно можно только одну. Направление — отдельный параметр `order`:
+# общий на весь ORDER BY, а не свой на колонку, — в выборке одно направление.
+# Значение строкой (`ASC`/`DESC`), не `boolean`: по имени параметра и так не
+# видно, что означает `true`, а по строке видно — тем более что это те же
+# буквы, что в самом SQL.
+# `order` — зарезервированное слово Postgres, поэтому `@order` sqlc не
+# принимает («syntax error at or near "order"») — только `sqlc.arg('order')`,
+# где имя внутри строки, а не токен SQL.
+ORDER_TEXT_PARAM = "@order_by::text"
+ORDER_DIRECTION_PARAM = "sqlc.arg('order')::text"
+ASCENDING = "ASC"
+DESCENDING = "DESC"
 
 # Постраничность: имена параметров фиксированы, иначе их неоткуда взять.
 # Тип пишем явно — sqlc не выводит его для параметров LIMIT/OFFSET сам.
+# OFFSET считается из номера страницы, а не приходит отдельным параметром —
+# вызывающему коду тогда незачем самому умножать `(page-1)*page_limit`.
 LIMIT_PARAM = "@page_limit::int"
-OFFSET_PARAM = "@page_offset::int"
+# В самом OFFSET — обязательно sqlc.arg(), не `@name`: sqlc 1.31 ломает вывод
+# параметров, когда в одном арифметическом выражении встречаются два разных
+# `@name` (пусть даже один из них — `@page_limit`, уже использованный в LIMIT
+# этой же строки) — тогда компиляция падает на "column ... does not exist"
+# или "edit stop location is out of bounds". `sqlc.arg('page_limit')` и
+# `@page_limit` из LIMIT sqlc сводит к одному параметру сам, по имени.
+OFFSET_EXPR = "(sqlc.arg('page')::int-1)*sqlc.arg('page_limit')::int"
 
 # Шапка счётчика к постраничному запросу. Выравнивание по `AS` — часть текста,
 # поэтому строки лежат как есть, а не собираются из кусков.
 _COUNT_SELECT = (
     "SELECT",
-    "    count(*)                                                        AS total_rows,",
+    "    count(*)                                                        AS total_items,",
     "    ceil(count(*)::numeric / GREATEST(@page_limit::int, 1))::bigint AS total_pages",
 )
 
@@ -181,10 +201,15 @@ def default_query_path(folder: str | Path) -> Path:
     return Path(folder) / QUERY_FILENAME
 
 
-# Параметр в готовом SQL: `@имя`, `@имя::тип` или `sqlc.narg('имя')::тип`.
+# Параметр в готовом SQL: `@имя`, `@имя::тип`, `sqlc.narg('имя')::тип` или
+# `sqlc.arg('имя')::тип`. Последняя форма — там, где имя параметра совпадает
+# с зарезервированным словом Postgres (`order`): `@order` там, где sqlc
+# ожидает идентификатор, ловит `syntax error at or near "order"`, а
+# `sqlc.arg('order')` — нет, потому что имя внутри кавычек, не токен SQL.
 _PARAM = re.compile(
     r"@(?P<named>[a-z_][a-z0-9_]*)(?:::(?P<cast>[a-z][a-z0-9_ ]*))?"
     r"|sqlc\.narg\('(?P<narg>[^']+)'\)(?:::(?P<narg_cast>[a-z][a-z0-9_ ]*))?"
+    r"|sqlc\.arg\('(?P<arg>[^']+)'\)(?:::(?P<arg_cast>[a-z][a-z0-9_ ]*))?"
 )
 
 
@@ -205,8 +230,10 @@ def params(sql: str) -> list[Param]:
     for match in _PARAM.finditer(sql):
         if match.group("named"):
             param = Param(match.group("named"), cast("cast"))
-        else:
+        elif match.group("narg"):
             param = Param(match.group("narg"), cast("narg_cast"), optional=True)
+        else:
+            param = Param(match.group("arg"), cast("arg_cast"))
         # Первое вхождение задаёт тип: дальше тот же параметр повторяется без
         # приведения — `sqlc.narg('x')::bool IS NULL OR col = sqlc.narg('x')`.
         found.setdefault(param.name, param)
@@ -395,7 +422,7 @@ def _read_sql(
     if not entry.get(PAGINATION_KEY):
         return _block(name, annotation, body)
 
-    body.append(f"LIMIT {LIMIT_PARAM} OFFSET {OFFSET_PARAM}")
+    body.append(f"LIMIT {LIMIT_PARAM} OFFSET {OFFSET_EXPR}")
     listing = _block(name, annotation, body)
 
     # Постраничному запросу нужен парный счётчик: без него неоткуда взять число
@@ -530,61 +557,75 @@ def _order_block(
 ) -> list[str]:
     """Строки `ORDER BY ...`.
 
-    Необязательные колонки становятся булевыми параметрами и собираются в один
-    `CASE`: вызывающий включает нужную сортировку флагом. `ELSE` обязателен —
-    без него `CASE` вернул бы `NULL` и порядок пропал бы совсем; в него идёт
-    первая обычная колонка сортировки, а если таких нет — первая колонка DDL.
+    `ASC`/`DESC` — модификатор всего выражения `CASE`, а не значение внутри
+    него: `CASE` не может вернуть их сам, и относятся они к ветке целиком,
+    не к отдельному `WHEN`. Поэтому у каждой колонки, участвующей в
+    сортировке, — своя пара `CASE`: один активен при `@order = 'ASC'`,
+    другой при `@order = 'DESC'`, и ровно один из них в каждой строке
+    не `NULL`. Колонки не делят пару между собой — иначе несколько `WHEN`
+    пришлось бы сводить к одному `END ASC`/`END DESC` на всех, а направление
+    относится именно к ветке одной колонки.
+
+    Необязательные (выбираемые) колонки решают, сработает ли их пара, через
+    `@order_by = 'имя_колонки'`. Обычные колонки сортировки участвуют всегда
+    и в этом условии не нуждаются — они не выбираются, а всегда идут следом
+    дополнительными ключами.
 
     У выборки списка (`always`) порядок есть всегда, даже когда не отмечено
     ничего: без `ORDER BY` Postgres волен вернуть строки в любом порядке, и
-    постраничная выборка начинает то повторять строки, то терять их.
+    постраничная выборка начинает то повторять строки, то терять их. Для
+    постраничной выборки без единой отмеченной колонки сортировки это ещё и
+    предупреждение: колонка для сортировки взята наугад, а не осознанно.
     """
-    order = ordering(entry, table, always=always)
-    if order.default is None:
-        return []
-
-    if not order.optional:
-        return ["ORDER BY " + ", ".join(field(table, column) for column in order.plain)]
-
-    optional, fallback = order.optional, order.default
-    _check_case_types(table, [*optional, fallback], query, problems)
-
-    lines = ["ORDER BY"]
-    for index, column in enumerate(optional):
-        # Выравнивание по первому WHEN: `CASE ` — ровно пять знаков.
-        head = "    CASE " if index == 0 else "         "
-        lines.append(
-            f"{head}WHEN {ORDER_PARAM}{column}{ORDER_PARAM_CAST} = true "
-            f"THEN {field(table, column)}"
-        )
-
-    # Остальные обычные колонки — дополнительными ключами после CASE.
-    tail = "".join(f", {field(table, column)}" for column in order.plain[1:])
-    lines.append(f"         ELSE {field(table, fallback)} END{tail}")
-    return lines
-
-
-def _check_case_types(
-    table: Table, columns: list[str], query: str, problems: list[Problem]
-) -> None:
-    """Ветки `CASE` обязаны быть одного типа — иначе Postgres отвергнет запрос."""
-    kinds: dict[str, str] = {}
-    for name in columns:
-        column = table.column(name)
-        if column is not None:
-            kinds.setdefault(column.sql_type, name)
-
-    if len(kinds) > 1:
-        listed = ", ".join(f"{name} {sql_type}" for sql_type, name in kinds.items())
+    columns = entry.get(COLUMNS_KEY) or []
+    if (
+        always
+        and entry.get(PAGINATION_KEY)
+        and not any(col.get(ORDER_BY_KEY) or col.get(ORDER_BY_OPTIONAL_KEY) for col in columns)
+    ):
         problems.append(
             Problem(
                 table.name,
                 query,
-                f"ORDER BY CASE смешивает типы ({listed}) — Postgres такой запрос "
-                "не выполнит",
+                "постраничность без отмеченной колонки ORDER BY — сортировка "
+                "взята по первой колонке DDL",
                 fatal=False,
             )
         )
+
+    order = ordering(entry, table, always=always)
+    if order.default is None:
+        return []
+
+    terms: list[str] = []
+    for column in order.optional:
+        terms.append(_order_term(table, column, selectable=True, reverse=False))
+        terms.append(_order_term(table, column, selectable=True, reverse=True))
+    for column in order.plain:
+        terms.append(_order_term(table, column, selectable=False, reverse=False))
+        terms.append(_order_term(table, column, selectable=False, reverse=True))
+
+    lines = [f"{term}," for term in terms[:-1]] + [terms[-1]]
+    return [f"ORDER BY {lines[0]}"] + [f"    {line}" for line in lines[1:]]
+
+
+def _order_term(table: Table, column: str, *, selectable: bool, reverse: bool) -> str:
+    """Одна ветка сортировки: своя колонка, своё направление, свой `CASE`.
+
+    Ветка возрастания срабатывает не на точное `= 'ASC'`, а на
+    `<> 'DESC'` — иначе пустая строка (zero value Go, когда вызывающий
+    забыл проставить `order`) не подошла бы ни одной из двух веток: обе
+    вернули бы `NULL` для каждой строки, и сортировка исчезла бы вовсе, а не
+    просто взяла бы направление по умолчанию.
+    """
+    if reverse:
+        cond = f"{ORDER_DIRECTION_PARAM} = '{DESCENDING}'"
+    else:
+        cond = f"{ORDER_DIRECTION_PARAM} <> '{DESCENDING}'"
+    if selectable:
+        cond = f"{cond} AND {ORDER_TEXT_PARAM} = '{column}'"
+    direction = "DESC" if reverse else "ASC"
+    return f"CASE WHEN {cond} THEN {field(table, column)} END {direction}"
 
 
 def _where_block(entry: dict, table: Table, value_key: str) -> list[str]:
@@ -606,9 +647,19 @@ def _where_block(entry: dict, table: Table, value_key: str) -> list[str]:
             conditions.append(
                 f"({param}{cast} IS NULL OR {field(table, name)} = {param})"
             )
+        elif value_key == EXACT_WHERE_KEY and written:
+            # EXACT WHERE — самостоятельное условие в READ: колонка не отмечена
+            # ни WHERE, ни WHERE OPTIONAL, но значение всё равно должно попасть
+            # в запрос через AND, а не молча потеряться.
+            conditions.append(f"{field(table, name)} = {written}")
 
     custom = (entry.get(CUSTOM_WHERE_KEY) or "").strip()
     if custom:
+        # Автор мог вписать условие, скопированное из готового запроса, —
+        # вместе с ведущим WHERE и конечной точкой с запятой. Срезаем их,
+        # иначе внутри скобок получится `(WHERE ...;)`.
+        custom = custom.rstrip(";").strip()
+        custom = re.sub(r"(?i)^where\s+", "", custom)
         # В скобках: своё условие может содержать OR и молча расширить выборку.
         conditions.append(f"({custom})")
 
