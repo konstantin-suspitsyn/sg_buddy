@@ -59,6 +59,8 @@ from .settings import (
 )
 
 ASSETS = Path(__file__).parent / "assets"
+# NiceGUI отдаёт favicon сам, до add_static_files, поэтому нужен путь на диске.
+FAVICON = ASSETS / "favicon.ico"
 LOGO = "/assets/hacker_dog.png"
 # Картинки лежат в пакете: программа работает без сети и без соседних репозиториев.
 MASCOT = "/assets/working_dog.png"

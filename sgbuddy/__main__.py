@@ -6,7 +6,7 @@ import argparse
 
 from nicegui import ui
 
-from .app import build
+from .app import FAVICON, build
 
 
 def main() -> None:
@@ -29,7 +29,7 @@ def main() -> None:
         native=args.native,
         show=not args.no_show,
         reload=False,
-        favicon="🛠",
+        favicon=FAVICON,
     )
 
 
