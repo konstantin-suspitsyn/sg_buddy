@@ -1,0 +1,73 @@
+# Релиз выпускается по версии из pyproject.toml, а не по теге, поставленному
+# руками: версия и так лежит в репозитории, и второй источник правды разошёлся
+# бы с первым молча. Нет релиза `v<версия>` — значит он новый и его надо выпустить;
+# есть — на main просто прогнались тесты, и это нормальный исход, а не ошибка.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Нужно, чтобы создать тег и сам релиз.
+permissions:
+  contents: write
+
+jobs:
+  # Невыпущенное лучше выпущенного сломанного: релиз идёт только за зелёными тестами.
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    needs: tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Вся история нужна `--generate-notes`: он собирает список изменений
+          # с прошлого релиза.
+          fetch-depth: 0
+
+      - name: Версия из pyproject.toml
+        id: version
+        run: |
+          version=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Версия в pyproject.toml: $version"
+
+      - name: Нужен ли новый релиз
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Релиз $tag уже есть — выпускать нечего."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Релиза $tag нет — выпускаем."
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.check.outputs.needed == 'true'
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Сборка
+        if: steps.check.outputs.needed == 'true'
+        run: uv build
+
+      # Тег создаётся самим релизом из этого коммита — отдельным шагом его
+      # ставить не надо.
+      - name: Релиз
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ steps.version.outputs.tag }}' dist/* \
+            --title 'SG Buddy ${{ steps.version.outputs.value }}' \
+            --generate-notes

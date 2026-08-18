@@ -1,4 +1,13 @@
 /.venv/
-/test_data/
 /.idea/
 /graphify-out/
+# Сборка: колёса и архивы, их выпускает релиз.
+/dist/
+
+# Из тестовых данных в репозитории лежит только сама схема: она вход, а не
+# артефакт, и без неё тесты не на чем прогнать. Всё, что генерируется рядом
+# с ней — query.sql, schema.json, .proto, — рабочее и в репозиторий не идёт.
+/test_data/*
+!/test_data/tables_model/
+/test_data/tables_model/*
+!/test_data/tables_model/schema.sql

@@ -1,0 +1,37 @@
+# Прогон тестов. Отдельным файлом, потому что его вызывает релиз: тесты нужны
+# и сами по себе, и как условие выпуска, а два одинаковых описания разошлись бы.
+name: tests
+
+on:
+  pull_request:
+  # Вызов из release.yml — на main тесты идут в составе релиза, не вторым прогоном.
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    # README обещает Windows, Linux и macOS. Windows проверяем потому, что
+    # программа windows-овая, Linux — потому что обещание надо чем-то держать.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          # Версию задаём явно: pyproject разрешает всё от 3.11, и без этого
+          # тесты шли бы на том Python, который окажется на раннере сегодня.
+          python-version: "3.12"
+
+      # `--locked` роняет прогон, если uv.lock отстал от pyproject: пересобранное
+      # на лету окружение проверяло бы не то, что стоит у пользователя.
+      - name: Окружение
+        run: uv sync --locked
+
+      - name: Тесты
+        run: uv run pytest -q
