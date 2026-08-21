@@ -21,6 +21,14 @@ from sgbuddy.settings import (
     CUSTOM_QUERY_KEY,
     CUSTOM_WHERE_KEY,
     EXACT_WHERE_KEY,
+    JOIN_ALIAS_KEY,
+    JOIN_NAME_KEY,
+    JOIN_ON_KEY,
+    JOIN_TABLE_KEY,
+    JOIN_TYPE_KEY,
+    JOINED_COLUMNS_KEY,
+    JOINS_KEY,
+    LINKS_KEY,
     MODE_KEY,
     NAME_KEY,
     ORDER_BY_KEY,
@@ -29,6 +37,7 @@ from sgbuddy.settings import (
     SET_KEY,
     SET_VALUE_KEY,
     SHOW_KEY,
+    USED_JOINS_KEY,
     WHERE_KEY,
     WHERE_OPTIONAL_KEY,
     WHERE_VALUE_KEY,
@@ -82,6 +91,9 @@ _ENTRY_KEYS = {
     "custom_where": CUSTOM_WHERE_KEY,
     "custom_query": CUSTOM_QUERY_KEY,
     "mode": MODE_KEY,
+    # Ключи join'ов есть только у выборок, которые их используют.
+    "joins": USED_JOINS_KEY,
+    "joined": JOINED_COLUMNS_KEY,
 }
 
 
@@ -102,3 +114,34 @@ def entry(name: str, *columns: dict, **rest) -> dict:
 def crud(table: str, **directions) -> dict:
     """Настройки с запросами одной таблицы: `crud("dc.alias", READ=[...])`."""
     return {CRUD_KEY: {table: {name: list(items) for name, items in directions.items()}}}
+
+
+def link(table: str, alias: str, on: str, type: str = "INNER") -> dict:
+    """Звено цепочки: к какой таблице и по какому условию присоединяемся."""
+    return {
+        JOIN_TYPE_KEY: type,
+        JOIN_TABLE_KEY: table,
+        JOIN_ALIAS_KEY: alias,
+        JOIN_ON_KEY: on,
+    }
+
+
+def chain(name: str, *links: dict) -> dict:
+    """Именованная цепочка: звеньев столько, сколько таблиц присоединяется."""
+    return {NAME_KEY: name, LINKS_KEY: list(links)}
+
+
+def jcol(join: str, alias: str, name: str, **flags) -> dict:
+    """Колонка приджойненной таблицы: те же флаги, что у своих, плюс цепочка."""
+    return {
+        JOIN_NAME_KEY: join,
+        JOIN_ALIAS_KEY: alias,
+        COLUMN_NAME_KEY: name,
+        **{_COLUMN_KEYS[key]: value for key, value in flags.items()},
+    }
+
+
+def with_joins(settings: dict, table: str, *chains: dict) -> dict:
+    """Дописывает к настройкам раздел `JOINS` одной таблицы."""
+    settings.setdefault(JOINS_KEY, {})[table] = list(chains)
+    return settings

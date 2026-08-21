@@ -18,6 +18,10 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
 
+    # Нужно шагу «Бейдж покрытия»: он коммитит JSON обратно в ветку.
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,4 +38,34 @@ jobs:
         run: uv sync --locked
 
       - name: Тесты
-        run: uv run pytest -q
+        run: uv run pytest -q --cov=sgbuddy --cov-report=term-missing
+
+      # Число одно и то же на обеих ОС — считаем и коммитим только с Linux,
+      # иначе два матричных job'а столкнутся, пушя один и тот же файл.
+      # На pull_request не пушим: у GITHUB_TOKEN там нет прав на запись,
+      # да и коммитить в чужую ветку из проверки PR не дело.
+      - name: Бейдж покрытия
+        if: matrix.os == 'ubuntu-latest' && github.event_name != 'pull_request'
+        run: |
+          percent=$(uv run coverage report --format=total)
+
+          color=red
+          if   [ "$percent" -ge 90 ]; then color=brightgreen
+          elif [ "$percent" -ge 75 ]; then color=green
+          elif [ "$percent" -ge 60 ]; then color=yellowgreen
+          elif [ "$percent" -ge 40 ]; then color=yellow
+          elif [ "$percent" -ge 20 ]; then color=orange
+          fi
+
+          mkdir -p .github/badges
+          cat > .github/badges/coverage.json <<JSON
+          {"schemaVersion": 1, "label": "coverage", "message": "${percent}%", "color": "${color}"}
+          JSON
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/coverage.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Обновлён бейдж покрытия (${percent}%)"
+            git push
+          fi

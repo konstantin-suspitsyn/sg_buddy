@@ -18,12 +18,21 @@ from sgbuddy.settings import (
     CRUD_KEY,
     CUSTOM_QUERY_KEY,
     EXACT_WHERE_KEY,
+    JOIN_ALIAS_KEY,
+    JOIN_NAME_KEY,
+    JOIN_ON_KEY,
+    JOIN_TABLE_KEY,
+    JOIN_TYPE_KEY,
+    JOINED_COLUMNS_KEY,
+    JOINS_KEY,
+    LINKS_KEY,
     NAME_KEY,
     ORDER_BY_KEY,
     ORDER_BY_OPTIONAL_KEY,
     PAGINATION_KEY,
     SET_KEY,
     SHOW_KEY,
+    USED_JOINS_KEY,
     WHERE_KEY,
 )
 
@@ -39,6 +48,7 @@ def isolated_state(reference_tables, monkeypatch):
     monkeypatch.setattr(app, "read_form", None)
     monkeypatch.setattr(app, "update_form", None)
     monkeypatch.setattr(app, "delete_form", None)
+    monkeypatch.setattr(app, "join_form", None)
 
     app.workspace.tables = reference_tables
     app.workspace.settings = {}
@@ -48,6 +58,27 @@ def isolated_state(reference_tables, monkeypatch):
 
 def entries(table, direction) -> list:
     return app.workspace.settings[CRUD_KEY][table.name][direction]
+
+
+def chains(table) -> list:
+    return app.workspace.settings[JOINS_KEY][table.name]
+
+
+def add_chain(table, name: str = "with_user", alias: str = "u", **rest) -> None:
+    """Цепочка `dc.alias` -> `dc."user"`, добавленная через форму."""
+    app.join_form = app.JoinForm(
+        table=table.name,
+        name=name,
+        links=[
+            app.JoinLink(
+                type=rest.get("type", "LEFT"),
+                table=rest.get("joined", "dc.user"),
+                alias=alias,
+                on=rest.get("on", "u.id = alias.user_id"),
+            )
+        ],
+    )
+    app._submit_join(table)
 
 
 # ------------------------------------------------------------ имена запросов
@@ -276,3 +307,333 @@ def test_annotation_is_stored_as_chosen(alias):
     app.form = app.CreateForm(table=alias.name, name="CreateAlias", annotation="one")
     app._submit_create(alias)
     assert entries(alias, "CREATE")[0][ANNOTATION_KEY] == "one"
+
+
+# ---------------------------------------------------------------------- join'ы
+
+
+def test_chain_is_written_with_its_links(alias):
+    """Звеньев столько, сколько таблиц присоединяется, и в порядке записи."""
+    app.join_form = app.JoinForm(
+        table=alias.name,
+        name="with_user",
+        links=[
+            app.JoinLink("INNER", "dc.host", "h", "h.id = alias.id"),
+            app.JoinLink("LEFT", "dc.user", "u", "u.id = alias.user_id"),
+        ],
+    )
+    app._submit_join(alias)
+
+    chain = chains(alias)[0]
+    assert chain[NAME_KEY] == "with_user"
+    assert [link[JOIN_ALIAS_KEY] for link in chain[LINKS_KEY]] == ["h", "u"]
+    assert chain[LINKS_KEY][1] == {
+        JOIN_TYPE_KEY: "LEFT",
+        JOIN_TABLE_KEY: "dc.user",
+        JOIN_ALIAS_KEY: "u",
+        JOIN_ON_KEY: "u.id = alias.user_id",
+    }
+    # Черновик живёт до «Добавить» — после записи его нет.
+    assert app.join_form is None
+
+
+def test_join_section_appears_only_for_tables_with_chains(alias):
+    add_chain(alias)
+    assert set(app.workspace.settings[JOINS_KEY]) == {alias.name}
+
+
+@pytest.mark.parametrize(
+    ("link", "expected"),
+    [
+        (app.JoinLink("LEFT", "", "u", "u.id = alias.user_id"), "выберите таблицу"),
+        (app.JoinLink("LEFT", "dc.нет", "u", "u.id = alias.user_id"), "выберите таблицу"),
+        # Из алиаса собираются имена колонок и параметров.
+        (app.JoinLink("LEFT", "dc.user", "user", "u.id = alias.user_id"), "не годится"),
+        (app.JoinLink("LEFT", "dc.user", "u u", "u.id = alias.user_id"), "не годится"),
+        (app.JoinLink("LEFT", "dc.user", "", "u.id = alias.user_id"), "не годится"),
+        # Алиас своей таблицы занят ею самой.
+        (app.JoinLink("LEFT", "dc.user", "alias", "u.id = alias.user_id"), "уже занят"),
+        (app.JoinLink("LEFT", "dc.user", "u", "   "), "условие ON"),
+    ],
+)
+def test_join_form_refuses_a_link_it_cannot_write(alias, link, expected):
+    app.join_form = app.JoinForm(table=alias.name, name="with_user", links=[link])
+    app._submit_join(alias)
+
+    assert expected in app.join_form.error
+    assert JOINS_KEY not in app.workspace.settings
+
+
+def test_chain_needs_a_name(alias):
+    app.join_form = app.JoinForm(
+        table=alias.name, links=[app.JoinLink("LEFT", "dc.user", "u", "u.id = alias.user_id")]
+    )
+    app._submit_join(alias)
+    assert "укажите название" in app.join_form.error
+
+
+def test_chain_name_is_unique_within_the_table(alias):
+    add_chain(alias)
+    add_chain(alias, alias="u2")
+
+    assert len(chains(alias)) == 1
+    assert "уже есть" in app.join_form.error
+
+
+def test_alias_is_suggested_from_the_table_name(alias):
+    draft = app.JoinForm(table=alias.name)
+    assert app.suggest_alias(draft, alias, "dc.host") == "host"
+    # Короткое имя — слово SQL: такой алиас не годится, придумывать за автора нечего.
+    assert app.suggest_alias(draft, alias, "dc.user") == ""
+    # Занятый алиас разводим номером, а не молча повторяем.
+    draft.links = [app.JoinLink("LEFT", "dc.host", "host", "")]
+    assert app.suggest_alias(draft, alias, "dc.host") == "host2"
+
+
+def test_link_can_be_added_and_the_last_one_stays(alias):
+    """Цепочка без звеньев — не цепочка: пустое звено заводится заново."""
+    app.join_form = app.JoinForm(table=alias.name)
+    app._add_link()
+    assert len(app.join_form.links) == 2
+
+    app._remove_link(1)
+    app._remove_link(0)
+    assert len(app.join_form.links) == 1
+
+
+def read_with_chain(alias, name: str = "GetAliasesWithUser") -> None:
+    app.read_form = app.ReadForm(
+        table=alias.name,
+        name=name,
+        annotation="many",
+        show={"id"},
+        joins={"with_user"},
+        joined_show={("with_user", "u", "name")},
+        joined_where={("with_user", "u", "id")},
+        joined_exact={("with_user", "u", "is_deleted"): "false"},
+    )
+    app._submit_read(alias)
+
+
+def test_read_writes_join_keys_only_when_they_are_used(alias):
+    """У выборки без join'ов запись остаётся такой же, какой была до раздела."""
+    add_chain(alias)
+
+    app.read_form = app.ReadForm(table=alias.name, name="GetAliases", annotation="many")
+    app._submit_read(alias)
+    plain = entries(alias, "READ")[0]
+    assert USED_JOINS_KEY not in plain and JOINED_COLUMNS_KEY not in plain
+
+    read_with_chain(alias)
+    joined = entries(alias, "READ")[1]
+    assert joined[USED_JOINS_KEY] == ["with_user"]
+
+
+def test_read_describes_every_joined_column(alias, user):
+    """Колонки пишутся все: в файле должно быть видно и то, что не отмечено."""
+    add_chain(alias)
+    read_with_chain(alias)
+
+    columns = entries(alias, "READ")[0][JOINED_COLUMNS_KEY]
+    assert [c[COLUMN_NAME_KEY] for c in columns] == list(user.column_names)
+    written = {c[COLUMN_NAME_KEY]: c for c in columns}
+    assert {c[JOIN_NAME_KEY] for c in columns} == {"with_user"}
+    assert {c[JOIN_ALIAS_KEY] for c in columns} == {"u"}
+    assert written["name"][SHOW_KEY] is True
+    assert written["id"][WHERE_KEY] is True
+    assert written["is_deleted"][EXACT_WHERE_KEY] == "false"
+    # Незаполненное поле — `null`, как и у своих колонок.
+    assert written["name"][EXACT_WHERE_KEY] is None
+
+
+def test_editing_returns_joined_flags_to_the_form(alias):
+    """Круг «открыть — сохранить» не должен терять отметки приджойненных колонок."""
+    add_chain(alias)
+    read_with_chain(alias)
+    before = entries(alias, "READ")[0]
+
+    app._edit_read(0, alias)
+    assert app.read_form.joins == {"with_user"}
+    assert app.read_form.joined_show == {("with_user", "u", "name")}
+    assert app.read_form.joined_where == {("with_user", "u", "id")}
+    assert app.read_form.joined_exact == {("with_user", "u", "is_deleted"): "false"}
+
+    app._submit_read(alias)
+    assert entries(alias, "READ")[0] == before
+
+
+def test_renaming_a_chain_follows_into_the_queries(alias):
+    """Выборка ссылается на цепочку по имени: со старым именем она не соберётся."""
+    add_chain(alias)
+    read_with_chain(alias)
+
+    app._edit_join(0, alias)
+    app.join_form.name = "with_owner"
+    app._submit_join(alias)
+
+    entry = entries(alias, "READ")[0]
+    assert entry[USED_JOINS_KEY] == ["with_owner"]
+    assert {c[JOIN_NAME_KEY] for c in entry[JOINED_COLUMNS_KEY]} == {"with_owner"}
+
+
+def test_removing_a_chain_clears_it_from_the_queries(alias):
+    """Ссылка на исчезнувшую цепочку сорвала бы генерацию всего запроса."""
+    add_chain(alias)
+    read_with_chain(alias)
+
+    app._remove_join(0, alias)
+
+    entry = entries(alias, "READ")[0]
+    assert entry[USED_JOINS_KEY] == []
+    assert entry[JOINED_COLUMNS_KEY] == []
+    assert chains(alias) == []
+
+
+# ------------------------------------------------------------- копия запроса
+
+
+DIRECTIONS_TO_COPY = [
+    (
+        "CREATE",
+        "form",
+        lambda table: app.CreateForm(table=table.name, name="CreateAlias"),
+        app._submit_create,
+        app._copy_create,
+    ),
+    (
+        "READ",
+        "read_form",
+        lambda table: app.ReadForm(table=table.name, name="GetAliases", annotation="many"),
+        app._submit_read,
+        app._copy_read,
+    ),
+    (
+        "UPDATE",
+        "update_form",
+        lambda table: app.UpdateForm(table=table.name, name="UpdateAlias", sets={"name"}),
+        app._submit_update,
+        app._copy_update,
+    ),
+    (
+        "DELETE",
+        "delete_form",
+        lambda table: app.DeleteForm(
+            table=table.name, name="DeleteAlias", mode=app.SOFT_DELETE, sets={"is_deleted"}
+        ),
+        app._submit_delete,
+        app._copy_delete,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("direction", "attr", "draft", "submit", "copy"),
+    DIRECTIONS_TO_COPY,
+    ids=[item[0] for item in DIRECTIONS_TO_COPY],
+)
+def test_copy_repeats_the_record_in_a_new_one(alias, direction, attr, draft, submit, copy):
+    """Копия — та же запись новой: сохранение ляжет рядом, а не поверх исходной."""
+    setattr(app, attr, draft(alias))
+    submit(alias)
+    original = dict(entries(alias, direction)[0])
+
+    copy(0, alias)
+    form = getattr(app, attr)
+    # `editing` пуст — форма предлагает «Добавить», а не «Сохранить».
+    assert form.editing is None
+    # Имя переносится как есть: придумывать за автора новое здесь нечего.
+    assert form.name == original[NAME_KEY]
+
+    form.name = original[NAME_KEY] + "Copy"
+    submit(alias)
+
+    listing = entries(alias, direction)
+    assert len(listing) == 2
+    assert listing[0] == original
+    assert listing[1] == {**original, NAME_KEY: original[NAME_KEY] + "Copy"}
+
+
+def test_copy_of_a_read_carries_its_joins(alias):
+    """«Абсолютно те же настройки» — вместе с цепочками и их колонками."""
+    add_chain(alias)
+    read_with_chain(alias)
+    original = dict(entries(alias, "READ")[0])
+
+    app._copy_read(0, alias)
+    assert app.read_form.joins == {"with_user"}
+    assert app.read_form.joined_show == {("with_user", "u", "name")}
+
+    app.read_form.name = "GetAliasesWithUserCopy"
+    app._submit_read(alias)
+
+    copy = entries(alias, "READ")[1]
+    assert copy[USED_JOINS_KEY] == original[USED_JOINS_KEY]
+    assert copy[JOINED_COLUMNS_KEY] == original[JOINED_COLUMNS_KEY]
+
+
+def test_copy_saved_under_the_same_name_is_refused(alias):
+    """Имя запроса уникально по всему файлу — двойника sqlc не простит."""
+    app.form = app.CreateForm(table=alias.name, name="CreateAlias")
+    app._submit_create(alias)
+
+    app._copy_create(0, alias)
+    app._submit_create(alias)
+
+    assert "уже есть" in app.form.error
+    assert len(entries(alias, "CREATE")) == 1
+
+
+def test_copy_of_a_chain_repeats_its_links(alias):
+    """Цепочки соседних таблиц отличаются звеном — копию правят, а не набирают."""
+    app.join_form = app.JoinForm(
+        table=alias.name,
+        name="with_user",
+        links=[
+            app.JoinLink("INNER", "dc.host", "h", "h.id = alias.id"),
+            app.JoinLink("LEFT", "dc.user", "u", "u.id = alias.user_id"),
+        ],
+    )
+    app._submit_join(alias)
+    original = dict(chains(alias)[0])
+
+    app._copy_join(0, alias)
+    assert app.join_form.editing is None
+    assert app.join_form.name == "with_user"
+    assert [link.alias for link in app.join_form.links] == ["h", "u"]
+    assert [link.type for link in app.join_form.links] == ["INNER", "LEFT"]
+    assert [link.on for link in app.join_form.links] == [
+        "h.id = alias.id",
+        "u.id = alias.user_id",
+    ]
+
+    app.join_form.name = "with_user_and_host"
+    app._submit_join(alias)
+
+    assert chains(alias)[0] == original
+    assert chains(alias)[1] == {**original, NAME_KEY: "with_user_and_host"}
+
+
+def test_copy_of_a_chain_under_the_same_name_is_refused(alias):
+    """Имя цепочки уникально в пределах таблицы — ссылки выборок по нему и ходят."""
+    add_chain(alias)
+
+    app._copy_join(0, alias)
+    app._submit_join(alias)
+
+    assert "уже есть" in app.join_form.error
+    assert len(chains(alias)) == 1
+
+
+def test_copying_a_chain_does_not_touch_the_queries(alias):
+    """Копия — новая цепочка: выборки продолжают ссылаться на исходную."""
+    add_chain(alias)
+    read_with_chain(alias)
+
+    app._copy_join(0, alias)
+    app.join_form.name = "with_owner"
+    app._submit_join(alias)
+
+    entry = entries(alias, "READ")[0]
+    assert entry[USED_JOINS_KEY] == ["with_user"]
+    assert {c[JOIN_NAME_KEY] for c in entry[JOINED_COLUMNS_KEY]} == {"with_user"}
+

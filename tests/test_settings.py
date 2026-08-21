@@ -192,3 +192,56 @@ def test_current_format_is_left_alone():
 
 def test_migration_of_empty_settings_is_harmless():
     assert st.migrate_crud({}) == {}
+
+
+# ---------------------------------------------------------------------- join'ы
+
+
+def test_joins_are_read_without_creating_the_section():
+    """От чтения в файле не должен заводиться пустой раздел каждой таблицы."""
+    data = {}
+    assert st.joins_of(data, "dc.alias") == []
+    assert data == {}
+
+
+def test_ensure_joins_creates_the_section_once():
+    data = {}
+    chains = st.ensure_joins(data, "dc.alias")
+    chains.append({st.NAME_KEY: "with_user"})
+
+    # Второй вызов отдаёт тот же список, а не заводит новый поверх.
+    assert st.ensure_joins(data, "dc.alias") is chains
+    assert data[st.JOINS_KEY]["dc.alias"] == [{st.NAME_KEY: "with_user"}]
+
+
+def test_join_name_is_unique_within_its_table_only():
+    """В sqlc имя цепочки не попадает — у соседней таблицы может быть такое же."""
+    data = {
+        st.JOINS_KEY: {
+            "dc.alias": [{st.NAME_KEY: "with_user"}],
+            "dc.host": [{st.NAME_KEY: "with_user"}],
+        }
+    }
+    alias_chain = data[st.JOINS_KEY]["dc.alias"][0]
+    assert st.join_by_name(data, "dc.alias", "with_user") is alias_chain
+    assert st.join_by_name(data, "dc.host", "with_user") is not alias_chain
+    assert st.join_by_name(data, "dc.alias", "нет такой") is None
+
+
+def test_joins_lie_next_to_crud_not_inside_it():
+    """Цепочка описывает связь таблицы, а не запрос: её включают разные выборки."""
+    data = {}
+    st.ensure_directions(data, "dc.alias")
+    st.ensure_joins(data, "dc.alias")
+
+    assert st.JOINS_KEY in data
+    assert st.JOINS_KEY not in data[st.CRUD_KEY]["dc.alias"]
+
+
+def test_head_stays_first_when_joins_are_written():
+    """Раздел join'ов — такое же содержимое файла, как CRUD: шапка выше него."""
+    old = {st.JOINS_KEY: {"dc.alias": []}, st.CRUD_KEY: {}}
+    data = st.with_paths(old, "C:/dc", "C:/dc/api.proto")
+    assert tuple(data)[:5] == HEAD
+    assert st.JOINS_KEY in data
+

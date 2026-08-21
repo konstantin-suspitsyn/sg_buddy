@@ -22,7 +22,15 @@ from nicegui import app, ui
 
 from .ddl import DDLError, Table, parse_schema_file
 from .proto_gen import generate as generate_proto
-from .query_gen import QUERY_FILENAME, GenerationError, default_query_path, generate
+from .query_gen import (
+    JOIN_TYPES,
+    QUERY_FILENAME,
+    GenerationError,
+    default_query_path,
+    generate,
+    ident,
+    is_alias,
+)
 from .settings import (
     ANNOTATION_KEY,
     GO_PACKAGE_KEY,
@@ -34,6 +42,13 @@ from .settings import (
     CUSTOM_WHERE_KEY,
     DIRECTIONS,
     EXACT_WHERE_KEY,
+    JOIN_ALIAS_KEY,
+    JOIN_NAME_KEY,
+    JOIN_ON_KEY,
+    JOIN_TABLE_KEY,
+    JOIN_TYPE_KEY,
+    JOINED_COLUMNS_KEY,
+    LINKS_KEY,
     MODE_KEY,
     NAME_KEY,
     ORDER_BY_KEY,
@@ -44,13 +59,16 @@ from .settings import (
     SET_VALUE_KEY,
     SETTINGS_FILENAME,
     SHOW_KEY,
+    USED_JOINS_KEY,
     WHERE_KEY,
     WHERE_OPTIONAL_KEY,
     WHERE_VALUE_KEY,
     all_entries,
     default_settings,
     ensure_directions,
+    ensure_joins,
     entries_of,
+    joins_of,
     migrate_crud,
     load_settings,
     save_settings,
@@ -70,8 +88,9 @@ PROTO_SUFFIX = ".proto"
 
 ACCENT = "#9370DB"
 
-# Четыре направления работы с таблицей. Что происходит по нажатию — следующий шаг.
-ACTIONS = ("Create", "Read", "Update", "Delete")
+# Что можно делать с таблицей. Join стоит после CRUD: он не запрос, а связь,
+# которую потом включают в выборку.
+ACTIONS = ("Create", "Read", "Update", "Delete", "Join")
 
 # Аннотации sqlc: INSERT возвращает строку или ничего, SELECT — строку или список.
 ANNOTATIONS = ("one", "exec")
@@ -87,6 +106,18 @@ UNDELETE = "UNDELETE"
 DELETE_MODES = (HARD_DELETE, SOFT_DELETE, UNDELETE)
 SET_MODES = (SOFT_DELETE, UNDELETE)
 ANNOTATION_HELP = "SQLC Query annotations"
+
+JOIN_HELP = (
+    "Цепочка — одна или несколько таблиц, присоединяемых по порядку. "
+    "Связь «многие ко многим» собирается из двух звеньев: сперва связующая "
+    "таблица, потом целевая."
+)
+
+JOIN_READ_HELP = (
+    "Колонки приджойненной таблицы выходят под именем с алиасом (alias_column): "
+    "двух одинаковых имён в одной выборке sqlc не примет. Этим же именем "
+    "называются их параметры."
+)
 
 CUSTOM_WHERE_HELP = (
     "Своё условие WHERE. Приклеивается к остальным через AND, "
@@ -385,6 +416,11 @@ STYLES = """
     background: var(--accent);
     border-color: var(--accent);
   }
+  /* Пять кнопок в узкой колонке списка: общих отступов на них не хватает —
+     ряд перестаёт помещаться в карточку и последняя кнопка обрезается. */
+  .crud-btn.table-btn.q-btn {
+    padding: 1px 4px;
+  }
 
   /* ---------- таблица полей в форме ---------- */
 
@@ -514,13 +550,14 @@ workspace = Workspace()
 
 def reset_all() -> None:
     """«Начать заново»: программа возвращается к пустому первому шагу."""
-    global form, read_form, update_form, delete_form
+    global form, read_form, update_form, delete_form, join_form
 
     workspace.reset()
     form = None
     read_form = None
     update_form = None
     delete_form = None
+    join_form = None
     wizard.refresh()
 
 
@@ -708,12 +745,13 @@ def _proto_card() -> None:
 def _proto_picker() -> None:
     ui.label("Файл контракта").classes("field-label")
 
-    # Путь из прежних настроек важнее имени по умолчанию: его уже выбирали руками.
-    suggested = workspace.saved_proto or default_proto_path()
+    # Путь подставляем только из прежних настроек: для новой папки без schema.json
+    # угадывать имя файла не нужно, поле остаётся пустым.
+    suggested = workspace.saved_proto
 
     with ui.row().classes("w-full items-center gap-3 no-wrap q-mt-xs"):
         path_input = (
-            ui.input(value=str(suggested))
+            ui.input(value=str(suggested) if suggested else "")
             .props("outlined dense")
             .classes("grow")
         )
@@ -1114,7 +1152,7 @@ def _table_row(table: Table) -> None:
                     on_click=lambda t=table.name, a=action: select(t, a),
                     color=None,
                 ).props("flat no-caps dense").classes(
-                    "crud-btn active" if active else "crud-btn"
+                    "crud-btn table-btn active" if active else "crud-btn table-btn"
                 )
 
 
@@ -1226,11 +1264,16 @@ def _suggest_button(draft, suggestion) -> None:
 
 
 def _counts(table: Table) -> None:
-    """`C:00 R:00 U:00 D:00` — сколько запросов уже описано по каждому направлению."""
+    """`C:00 R:00 U:00 D:00 J:00` — сколько уже описано запросов и цепочек."""
     with ui.row().classes("counts no-wrap"):
         for letter, direction in zip("CRUD", DIRECTIONS):
             total = len(entries_of(workspace.settings, table.name, direction))
             ui.label(f"{letter}:{total:02d}").classes("on" if total else "off")
+
+        # Join'ов у таблицы может не быть вовсе — это обычное дело, а не
+        # незаполненность, поэтому нулевой счётчик не красим красным.
+        total = len(joins_of(workspace.settings, table.name))
+        ui.label(f"J:{total:02d}").classes("on" if total else "")
 
 
 def _detail() -> None:
@@ -1258,6 +1301,8 @@ def _detail() -> None:
                 _update_form(table)
             elif workspace.selected_action == "Delete":
                 _delete_form(table)
+            elif workspace.selected_action == "Join":
+                _join_form(table)
 
         if workspace.selected_action == "Create":
             _created_list(table)
@@ -1267,6 +1312,8 @@ def _detail() -> None:
             _update_list(table)
         elif workspace.selected_action == "Delete":
             _delete_list(table)
+        elif workspace.selected_action == "Join":
+            _join_list(table)
 
 
 # ---------------------------------------------------------------- форма Create
@@ -1360,8 +1407,13 @@ def _name_taken(
     return False
 
 
-def _edit_create(index: int, table: Table) -> None:
-    """Загружает запись обратно в форму."""
+def _edit_create(index: int, table: Table, *, editing: bool = True) -> None:
+    """Загружает запись обратно в форму — правкой или копией.
+
+    Копия несёт те же настройки, включая название: имя запроса уникально по
+    всему файлу, и придумывать за автора новое здесь нечего — форма скажет,
+    что название занято, когда он нажмёт «Добавить».
+    """
     global form
 
     entry = entries_of(workspace.settings, table.name, "CREATE")[index]
@@ -1379,9 +1431,14 @@ def _edit_create(index: int, table: Table) -> None:
         },
         excluded={col.name for col in table.columns if col.name not in written},
         custom_query=entry.get(CUSTOM_QUERY_KEY) or "",
-        editing=index,
+        editing=index if editing else None,
     )
     wizard.refresh()
+
+
+def _copy_create(index: int, table: Table) -> None:
+    """Та же вставка новой записью: сохранение ляжет рядом с исходной."""
+    _edit_create(index, table, editing=False)
 
 
 def _remove_create(index: int, table: Table) -> None:
@@ -1498,6 +1555,11 @@ def _created_list(table: Table) -> None:
                         color=None,
                     ).props("flat no-caps dense").classes("crud-btn")
                     ui.button(
+                        "Скопировать",
+                        on_click=lambda i=index: _copy_create(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn")
+                    ui.button(
                         "Удалить",
                         on_click=lambda i=index: _remove_create(i, table),
                         color=None,
@@ -1533,6 +1595,16 @@ class ReadForm:
     # сортировать всю таблицу подряд никто не просил.
     order_by: set[str] = field(default_factory=set)
     order_by_optional: set[str] = field(default_factory=set)
+    # Включённые цепочки join'ов — именами из раздела JOINS.
+    joins: set[str] = field(default_factory=set)
+    # Колонки приджойненных таблиц. Ключ — (цепочка, алиас, колонка): в одной
+    # выборке встречаются `id` нескольких таблиц, и имени колонки тут мало.
+    joined_show: set[tuple[str, str, str]] = field(default_factory=set)
+    joined_where: set[tuple[str, str, str]] = field(default_factory=set)
+    joined_where_optional: set[tuple[str, str, str]] = field(default_factory=set)
+    joined_exact: dict[tuple[str, str, str], str] = field(default_factory=dict)
+    joined_order_by: set[tuple[str, str, str]] = field(default_factory=set)
+    joined_order_by_optional: set[tuple[str, str, str]] = field(default_factory=set)
     custom_where: str = ""
     custom_query: str = ""
     error: str | None = None
@@ -1550,6 +1622,38 @@ def read_form_for(table: Table) -> ReadForm:
             show={col.name for col in table.columns},
         )
     return read_form
+
+
+def _read_join_links(table: Table, draft: ReadForm) -> list[tuple[str, str, Table]]:
+    """(цепочка, алиас, таблица) по звеньям включённых цепочек, в их порядке.
+
+    Звено с таблицей, которой в схеме уже нет, сюда не попадает: форма
+    показывает только то, что можно выбрать, а о пропаже скажет генератор —
+    он один решает, собирается запрос или нет.
+    """
+    by_name = {item.name: item for item in workspace.tables}
+    links: list[tuple[str, str, Table]] = []
+
+    for chain in joins_of(workspace.settings, table.name):
+        name = (chain.get(NAME_KEY) or "").strip()
+        if name not in draft.joins:
+            continue
+        for link in chain.get(LINKS_KEY) or []:
+            joined = by_name.get(link.get(JOIN_TABLE_KEY) or "")
+            alias = (link.get(JOIN_ALIAS_KEY) or "").strip()
+            if joined is not None and alias:
+                links.append((name, alias, joined))
+
+    return links
+
+
+def _used_joins(table: Table, draft: ReadForm) -> list[str]:
+    """Имена включённых цепочек в порядке раздела JOINS — в нём же они в SQL."""
+    return [
+        name
+        for chain in joins_of(workspace.settings, table.name)
+        if (name := (chain.get(NAME_KEY) or "").strip()) in draft.joins
+    ]
 
 
 def _submit_read(table: Table) -> None:
@@ -1586,14 +1690,42 @@ def _submit_read(table: Table) -> None:
             described[ORDER_BY_OPTIONAL_KEY] = col.name in draft.order_by_optional
         return described
 
+    def joined_column(chain: str, alias: str, col) -> dict:
+        key = (chain, alias, col.name)
+        described = {
+            JOIN_NAME_KEY: chain,
+            JOIN_ALIAS_KEY: alias,
+            COLUMN_NAME_KEY: col.name,
+            SHOW_KEY: key in draft.joined_show,
+            WHERE_KEY: key in draft.joined_where,
+            WHERE_OPTIONAL_KEY: key in draft.joined_where_optional,
+            EXACT_WHERE_KEY: (draft.joined_exact.get(key) or "").strip() or None,
+        }
+        if many:
+            described[ORDER_BY_KEY] = key in draft.joined_order_by
+            described[ORDER_BY_OPTIONAL_KEY] = key in draft.joined_order_by_optional
+        return described
+
+    links = _read_join_links(table, draft)
+
     entry = {
         NAME_KEY: name,
         ANNOTATION_KEY: draft.annotation,
         PAGINATION_KEY: many and draft.pagination,
-        COLUMNS_KEY: [column(col) for col in table.columns],
-        CUSTOM_WHERE_KEY: (draft.custom_where or "").strip() or None,
-        CUSTOM_QUERY_KEY: (draft.custom_query or "").strip() or None,
     }
+    # Ключи join'ов появляются только у выборок, которые их используют: у
+    # остальных запись остаётся ровно такой, какой была до join'ов вовсе.
+    if links:
+        entry[USED_JOINS_KEY] = _used_joins(table, draft)
+    entry[COLUMNS_KEY] = [column(col) for col in table.columns]
+    if links:
+        entry[JOINED_COLUMNS_KEY] = [
+            joined_column(chain, alias, col)
+            for chain, alias, joined in links
+            for col in joined.columns
+        ]
+    entry[CUSTOM_WHERE_KEY] = (draft.custom_where or "").strip() or None
+    entry[CUSTOM_QUERY_KEY] = (draft.custom_query or "").strip() or None
 
     if draft.editing is None:
         entries.append(entry)
@@ -1604,14 +1736,25 @@ def _submit_read(table: Table) -> None:
     wizard.refresh()
 
 
-def _edit_read(index: int, table: Table) -> None:
+def _edit_read(index: int, table: Table, *, editing: bool = True) -> None:
     global read_form
 
     entry = entries_of(workspace.settings, table.name, "READ")[index]
     written = {col[COLUMN_NAME_KEY]: col for col in entry.get(COLUMNS_KEY, [])}
+    joined = entry.get(JOINED_COLUMNS_KEY) or []
 
     def flagged(key: str) -> set[str]:
         return {name for name, col in written.items() if col.get(key)}
+
+    def key_of(col: dict) -> tuple[str, str, str]:
+        return (
+            col.get(JOIN_NAME_KEY) or "",
+            col.get(JOIN_ALIAS_KEY) or "",
+            col.get(COLUMN_NAME_KEY) or "",
+        )
+
+    def joined_flagged(key: str) -> set[tuple[str, str, str]]:
+        return {key_of(col) for col in joined if col.get(key)}
 
     read_form = ReadForm(
         table=table.name,
@@ -1628,11 +1771,27 @@ def _edit_read(index: int, table: Table) -> None:
         },
         order_by=flagged(ORDER_BY_KEY),
         order_by_optional=flagged(ORDER_BY_OPTIONAL_KEY),
+        joins=set(entry.get(USED_JOINS_KEY) or []),
+        joined_show=joined_flagged(SHOW_KEY),
+        joined_where=joined_flagged(WHERE_KEY),
+        joined_where_optional=joined_flagged(WHERE_OPTIONAL_KEY),
+        joined_exact={
+            key_of(col): col[EXACT_WHERE_KEY]
+            for col in joined
+            if col.get(EXACT_WHERE_KEY)
+        },
+        joined_order_by=joined_flagged(ORDER_BY_KEY),
+        joined_order_by_optional=joined_flagged(ORDER_BY_OPTIONAL_KEY),
         custom_where=entry.get(CUSTOM_WHERE_KEY) or "",
         custom_query=entry.get(CUSTOM_QUERY_KEY) or "",
-        editing=index,
+        editing=index if editing else None,
     )
     wizard.refresh()
+
+
+def _copy_read(index: int, table: Table) -> None:
+    """Та же выборка новой записью — вместе с join'ами и их колонками."""
+    _edit_read(index, table, editing=False)
 
 
 def _remove_read(index: int, table: Table) -> None:
@@ -1654,12 +1813,18 @@ def _cancel_read_edit() -> None:
 def _read_form(table: Table) -> None:
     draft = read_form_for(table)
 
-    def toggle(target: set[str], column: str, on: bool) -> None:
-        target.add(column) if on else target.discard(column)
+    def toggle(target: set, key, on: bool) -> None:
+        target.add(key) if on else target.discard(key)
 
     def set_annotation(value: str) -> None:
         draft.annotation = value
         # Галка постраничности имеет смысл только у many — перерисовываем форму.
+        wizard.refresh()
+
+    def toggle_join(name: str, on: bool) -> None:
+        # От включённой цепочки зависит состав формы: её колонки появляются
+        # своей сеткой, — здесь перерисовка обязательна.
+        toggle(draft.joins, name, on)
         wizard.refresh()
 
     ui.label("Название").classes("field-label q-mt-md")
@@ -1683,53 +1848,114 @@ def _read_form(table: Table) -> None:
                 on_change=lambda e: setattr(draft, "pagination", e.value),
             ).props("dense")
 
+    # Цепочки показываем, только если они у таблицы описаны: у таблицы без
+    # join'ов форма остаётся ровно такой, какой была.
+    chains = joins_of(workspace.settings, table.name)
+    if chains:
+        ui.label("Join").classes("field-label q-mt-md")
+        for chain in chains:
+            name = (chain.get(NAME_KEY) or "").strip()
+            with ui.row().classes("items-center gap-2 no-wrap q-mt-xs"):
+                ui.checkbox(
+                    name,
+                    value=name in draft.joins,
+                    on_change=lambda e, n=name: toggle_join(n, e.value),
+                ).props("dense")
+                ui.label(
+                    " · ".join(
+                        f"{link.get(JOIN_TYPE_KEY)} {link.get(JOIN_TABLE_KEY)} "
+                        f"{link.get(JOIN_ALIAS_KEY)}"
+                        for link in chain.get(LINKS_KEY) or []
+                    )
+                ).classes("hint")
+
     # Сортировка есть только у списка: у `one` строка одна, порядок ей ни к чему.
     many = draft.annotation == "many"
     grid = "read-order-grid" if many else "read-grid"
 
-    ui.label("Поля").classes("field-label q-mt-md")
-    with ui.element("div").classes(f"grid-head {grid} q-mt-xs"):
-        ui.label("поля")
-        ui.label("показать")
-        ui.label("добавить в WHERE")
-        ui.label("WHERE OPTIONAL")
-        ui.label("EXACT WHERE")
-        if many:
-            ui.label("ORDER BY")
-            ui.label("ORDER BY OPTIONAL")
+    def head() -> None:
+        with ui.element("div").classes(f"grid-head {grid} q-mt-xs"):
+            ui.label("поля")
+            ui.label("показать")
+            ui.label("добавить в WHERE")
+            ui.label("WHERE OPTIONAL")
+            ui.label("EXACT WHERE")
+            if many:
+                ui.label("ORDER BY")
+                ui.label("ORDER BY OPTIONAL")
 
-    for col in table.columns:
+    def row(col, key, groups: tuple, exact: dict, caption: str) -> None:
+        """Строка сетки. Ключ у своей колонки — имя, у приджойненной — тройка."""
+        show, where, where_optional, order_by, order_by_optional = groups
         with ui.element("div").classes(f"grid-row {grid}"):
             with ui.column().classes("gap-0"):
                 ui.label(col.name).classes("table-name")
-                ui.label(col.sql_type).classes("hint")
+                ui.label(caption).classes("hint")
             ui.checkbox(
-                value=col.name in draft.show,
-                on_change=lambda e, c=col.name: toggle(draft.show, c, e.value),
+                value=key in show,
+                on_change=lambda e: toggle(show, key, e.value),
             ).props("dense")
             ui.checkbox(
-                value=col.name in draft.where,
-                on_change=lambda e, c=col.name: toggle(draft.where, c, e.value),
+                value=key in where,
+                on_change=lambda e: toggle(where, key, e.value),
             ).props("dense")
             ui.checkbox(
-                value=col.name in draft.where_optional,
-                on_change=lambda e, c=col.name: toggle(draft.where_optional, c, e.value),
+                value=key in where_optional,
+                on_change=lambda e: toggle(where_optional, key, e.value),
             ).props("dense")
             ui.input(
-                value=draft.exact.get(col.name, ""),
-                on_change=lambda e, c=col.name: draft.exact.__setitem__(c, e.value),
+                value=exact.get(key, ""),
+                on_change=lambda e: exact.__setitem__(key, e.value),
             ).props("outlined dense")
             if many:
                 ui.checkbox(
-                    value=col.name in draft.order_by,
-                    on_change=lambda e, c=col.name: toggle(draft.order_by, c, e.value),
+                    value=key in order_by,
+                    on_change=lambda e: toggle(order_by, key, e.value),
                 ).props("dense")
                 ui.checkbox(
-                    value=col.name in draft.order_by_optional,
-                    on_change=lambda e, c=col.name: toggle(
-                        draft.order_by_optional, c, e.value
-                    ),
+                    value=key in order_by_optional,
+                    on_change=lambda e: toggle(order_by_optional, key, e.value),
                 ).props("dense")
+
+    own = (
+        draft.show,
+        draft.where,
+        draft.where_optional,
+        draft.order_by,
+        draft.order_by_optional,
+    )
+    joined = (
+        draft.joined_show,
+        draft.joined_where,
+        draft.joined_where_optional,
+        draft.joined_order_by,
+        draft.joined_order_by_optional,
+    )
+
+    ui.label("Поля").classes("field-label q-mt-md")
+    head()
+    for col in table.columns:
+        row(col, col.name, own, draft.exact, col.sql_type)
+
+    # Каждое звено — своей сеткой под своим алиасом: колонки разных таблиц в
+    # одном списке различались бы только именем, а имена у них совпадают.
+    links = _read_join_links(table, draft)
+    for chain, alias, joined_table in links:
+        with ui.row().classes("items-baseline gap-2 no-wrap q-mt-md"):
+            ui.label(f"{alias} · {joined_table.name}").classes("field-label")
+            ui.label(f"join {chain}").classes("hint")
+        head()
+        for col in joined_table.columns:
+            row(
+                col,
+                (chain, alias, col.name),
+                joined,
+                draft.joined_exact,
+                f"{col.sql_type} → {alias}_{col.name}",
+            )
+
+    if links:
+        ui.label(JOIN_READ_HELP).classes("hint q-mt-xs")
 
     if many:
         ui.label(ORDER_BY_HELP).classes("hint q-mt-xs")
@@ -1774,14 +2000,20 @@ def _read_list(table: Table) -> None:
         for index, entry in enumerate(entries):
             editing = read_form is not None and read_form.editing == index
             columns = entry.get(COLUMNS_KEY, [])
+            joined = entry.get(JOINED_COLUMNS_KEY) or []
+
+            def named(col: dict) -> str:
+                """Приджойненную колонку называем с алиасом: `id` бывает у обеих."""
+                alias = col.get(JOIN_ALIAS_KEY)
+                return f"{alias}.{col[COLUMN_NAME_KEY]}" if alias else col[COLUMN_NAME_KEY]
 
             def names(key: str) -> str:
-                picked = [c[COLUMN_NAME_KEY] for c in columns if c.get(key)]
+                picked = [named(c) for c in [*columns, *joined] if c.get(key)]
                 return ", ".join(picked) or "—"
 
             exact = [
-                f"{c[COLUMN_NAME_KEY]} = {c[EXACT_WHERE_KEY]}"
-                for c in columns
+                f"{named(c)} = {c[EXACT_WHERE_KEY]}"
+                for c in [*columns, *joined]
                 if c.get(EXACT_WHERE_KEY)
             ]
 
@@ -1798,12 +2030,23 @@ def _read_list(table: Table) -> None:
                         color=None,
                     ).props("flat no-caps dense").classes("crud-btn")
                     ui.button(
+                        "Скопировать",
+                        on_click=lambda i=index: _copy_read(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn")
+                    ui.button(
                         "Удалить",
                         on_click=lambda i=index: _remove_read(i, table),
                         color=None,
                     ).props("flat no-caps dense").classes("crud-btn danger")
 
-                lines = [
+                lines = []
+                # Строку join'ов пишем только у выборок, где они есть: у
+                # остальных это был бы прочерк ни о чём.
+                used = entry.get(USED_JOINS_KEY) or []
+                if used:
+                    lines.append(("JOIN", ", ".join(used)))
+                lines += [
                     ("показать", names(SHOW_KEY)),
                     ("WHERE", names(WHERE_KEY)),
                     ("WHERE OPTIONAL", names(WHERE_OPTIONAL_KEY)),
@@ -1907,7 +2150,7 @@ def _submit_update(table: Table) -> None:
     wizard.refresh()
 
 
-def _edit_update(index: int, table: Table) -> None:
+def _edit_update(index: int, table: Table, *, editing: bool = True) -> None:
     global update_form
 
     entry = entries_of(workspace.settings, table.name, "UPDATE")[index]
@@ -1938,9 +2181,14 @@ def _edit_update(index: int, table: Table) -> None:
         where_values=filled(WHERE_VALUE_KEY),
         custom_where=entry.get(CUSTOM_WHERE_KEY) or "",
         custom_query=entry.get(CUSTOM_QUERY_KEY) or "",
-        editing=index,
+        editing=index if editing else None,
     )
     wizard.refresh()
+
+
+def _copy_update(index: int, table: Table) -> None:
+    """То же изменение новой записью: сохранение ляжет рядом с исходным."""
+    _edit_update(index, table, editing=False)
 
 
 def _remove_update(index: int, table: Table) -> None:
@@ -2075,6 +2323,11 @@ def _update_list(table: Table) -> None:
                         color=None,
                     ).props("flat no-caps dense").classes("crud-btn")
                     ui.button(
+                        "Скопировать",
+                        on_click=lambda i=index: _copy_update(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn")
+                    ui.button(
                         "Удалить",
                         on_click=lambda i=index: _remove_update(i, table),
                         color=None,
@@ -2179,7 +2432,7 @@ def _submit_delete(table: Table) -> None:
     wizard.refresh()
 
 
-def _edit_delete(index: int, table: Table) -> None:
+def _edit_delete(index: int, table: Table, *, editing: bool = True) -> None:
     global delete_form
 
     entry = entries_of(workspace.settings, table.name, "DELETE")[index]
@@ -2204,9 +2457,14 @@ def _edit_delete(index: int, table: Table) -> None:
         where_values=filled(WHERE_VALUE_KEY),
         custom_where=entry.get(CUSTOM_WHERE_KEY) or "",
         custom_query=entry.get(CUSTOM_QUERY_KEY) or "",
-        editing=index,
+        editing=index if editing else None,
     )
     wizard.refresh()
+
+
+def _copy_delete(index: int, table: Table) -> None:
+    """То же удаление новой записью — вместе с режимом и его колонками."""
+    _edit_delete(index, table, editing=False)
 
 
 def _remove_delete(index: int, table: Table) -> None:
@@ -2354,6 +2612,11 @@ def _delete_list(table: Table) -> None:
                         color=None,
                     ).props("flat no-caps dense").classes("crud-btn")
                     ui.button(
+                        "Скопировать",
+                        on_click=lambda i=index: _copy_delete(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn")
+                    ui.button(
                         "Удалить",
                         on_click=lambda i=index: _remove_delete(i, table),
                         color=None,
@@ -2372,6 +2635,349 @@ def _delete_list(table: Table) -> None:
                     with ui.element("div").classes("record-row"):
                         ui.label(caption).classes("hint")
                         ui.label(value).classes("record-value")
+
+
+# ------------------------------------------------------------------ форма Join
+
+
+@dataclass
+class JoinLink:
+    """Звено цепочки: к какой таблице и по какому условию присоединяемся."""
+
+    type: str = JOIN_TYPES[0]
+    table: str = ""
+    alias: str = ""
+    on: str = ""
+
+
+@dataclass
+class JoinForm:
+    """Черновик одной цепочки. Живёт до нажатия «Добавить»."""
+
+    table: str
+    name: str = ""
+    links: list[JoinLink] = field(default_factory=lambda: [JoinLink()])
+    error: str | None = None
+    # Индекс правимой цепочки в JOINS или None, если это новая.
+    editing: int | None = None
+
+
+join_form: JoinForm | None = None
+
+
+def join_form_for(table: Table) -> JoinForm:
+    global join_form
+    if join_form is None or join_form.table != table.name:
+        join_form = JoinForm(table=table.name)
+    return join_form
+
+
+def suggest_alias(draft: JoinForm, table: Table, joined: str) -> str:
+    """Алиас по имени таблицы: `dc."order"` -> `order`, а занятый — `order2`.
+
+    Пустая строка означает «сами не придумали»: короткое имя бывает словом SQL
+    (`user`), а такой алиас не годится — из него собираются имена параметров.
+    """
+    short = joined.split(".")[-1].strip('"').lower()
+    if not is_alias(short):
+        return ""
+
+    taken = {table.short_name} | {link.alias for link in draft.links if link.alias}
+    if short not in taken:
+        return short
+    for number in range(2, 10):
+        if f"{short}{number}" not in taken:
+            return f"{short}{number}"
+    return ""
+
+
+def _add_link() -> None:
+    """Ещё одно звено: связь «многие ко многим» — это связующая и целевая таблицы."""
+    if join_form is not None:
+        join_form.links.append(JoinLink())
+    wizard.refresh()
+
+
+def _remove_link(index: int) -> None:
+    del join_form.links[index]
+    # Цепочка без звеньев — не цепочка: пустую форму заводим заново.
+    if not join_form.links:
+        join_form.links.append(JoinLink())
+    wizard.refresh()
+
+
+def _set_link_table(draft: JoinForm, link: JoinLink, table: Table, value: str) -> None:
+    """Выбор таблицы подставляет алиас, пока его не написали руками."""
+    link.table = value
+    if not link.alias:
+        link.alias = suggest_alias(draft, table, value)
+    wizard.refresh()
+
+
+def _join_name_taken(table: str, name: str, skip: int | None = None) -> bool:
+    """Имена цепочек уникальны в пределах таблицы: в sqlc они не попадают."""
+    for index, chain in enumerate(joins_of(workspace.settings, table)):
+        if index != skip and (chain.get(NAME_KEY) or "").strip() == name:
+            return True
+    return False
+
+
+def _submit_join(table: Table) -> None:
+    global join_form
+
+    draft = join_form_for(table)
+    name = (draft.name or "").strip()
+    if not name:
+        draft.error = "укажите название"
+        wizard.refresh()
+        return
+
+    if _join_name_taken(table.name, name, skip=draft.editing):
+        draft.error = f"join с названием {name!r} у таблицы уже есть"
+        wizard.refresh()
+        return
+
+    known = {item.name for item in workspace.tables}
+    # Алиас не должен сталкиваться ни с соседним звеном, ни с именем своей
+    # таблицы: `FROM dc."user" ... JOIN dc.role "user"` Postgres не примет.
+    aliases = {table.short_name}
+    links = []
+    for number, link in enumerate(draft.links, start=1):
+        if link.table not in known:
+            draft.error = f"звено {number}: выберите таблицу"
+            wizard.refresh()
+            return
+
+        alias = (link.alias or "").strip()
+        if not is_alias(alias):
+            draft.error = (
+                f"звено {number}: алиас {alias!r} не годится — нужно простое имя "
+                "латиницей, не совпадающее со словом SQL"
+            )
+            wizard.refresh()
+            return
+        if alias in aliases:
+            draft.error = f"звено {number}: алиас {alias!r} уже занят"
+            wizard.refresh()
+            return
+
+        on = (link.on or "").strip()
+        if not on:
+            draft.error = f"звено {number}: напишите условие ON"
+            wizard.refresh()
+            return
+
+        aliases.add(alias)
+        links.append(
+            {
+                JOIN_TYPE_KEY: link.type,
+                JOIN_TABLE_KEY: link.table,
+                JOIN_ALIAS_KEY: alias,
+                JOIN_ON_KEY: on,
+            }
+        )
+
+    chains = ensure_joins(workspace.settings, table.name)
+    chain = {NAME_KEY: name, LINKS_KEY: links}
+    if draft.editing is None:
+        chains.append(chain)
+    else:
+        previous = (chains[draft.editing].get(NAME_KEY) or "").strip()
+        chains[draft.editing] = chain
+        if previous != name:
+            _rename_join(table.name, previous, name)
+
+    join_form = None
+    wizard.refresh()
+
+
+def _rename_join(table: str, old: str, new: str) -> None:
+    """Выборки ссылаются на цепочку по имени — переименование ведём за собой."""
+    for entry in entries_of(workspace.settings, table, "READ"):
+        if USED_JOINS_KEY in entry:
+            entry[USED_JOINS_KEY] = [
+                new if used == old else used for used in entry[USED_JOINS_KEY]
+            ]
+        for col in entry.get(JOINED_COLUMNS_KEY) or []:
+            if col.get(JOIN_NAME_KEY) == old:
+                col[JOIN_NAME_KEY] = new
+
+
+def _forget_join(table: str, name: str) -> None:
+    """Убирает удалённую цепочку из выборок: ссылка на неё сорвёт генерацию."""
+    for entry in entries_of(workspace.settings, table, "READ"):
+        if USED_JOINS_KEY not in entry:
+            continue
+        entry[USED_JOINS_KEY] = [used for used in entry[USED_JOINS_KEY] if used != name]
+        entry[JOINED_COLUMNS_KEY] = [
+            col
+            for col in entry.get(JOINED_COLUMNS_KEY) or []
+            if col.get(JOIN_NAME_KEY) != name
+        ]
+
+
+def _edit_join(index: int, table: Table, *, editing: bool = True) -> None:
+    """Загружает цепочку обратно в форму — правкой или копией.
+
+    Имя, как и у запросов, переносится как есть: оно уникально в пределах
+    таблицы, и придумывать за автора новое здесь нечего.
+    """
+    global join_form
+
+    chain = joins_of(workspace.settings, table.name)[index]
+    join_form = JoinForm(
+        table=table.name,
+        name=chain.get(NAME_KEY, ""),
+        links=[
+            JoinLink(
+                type=(link.get(JOIN_TYPE_KEY) or JOIN_TYPES[0]),
+                table=link.get(JOIN_TABLE_KEY) or "",
+                alias=link.get(JOIN_ALIAS_KEY) or "",
+                on=link.get(JOIN_ON_KEY) or "",
+            )
+            for link in chain.get(LINKS_KEY) or []
+        ]
+        or [JoinLink()],
+        editing=index if editing else None,
+    )
+    wizard.refresh()
+
+
+def _copy_join(index: int, table: Table) -> None:
+    """Та же цепочка новой записью: сохранение ляжет рядом с исходной.
+
+    Цепочки соседних таблиц часто отличаются одним звеном — копию быстрее
+    поправить, чем набрать заново.
+    """
+    _edit_join(index, table, editing=False)
+
+
+def _remove_join(index: int, table: Table) -> None:
+    global join_form
+
+    chains = joins_of(workspace.settings, table.name)
+    name = (chains[index].get(NAME_KEY) or "").strip()
+    del chains[index]
+    _forget_join(table.name, name)
+    if join_form is not None and join_form.editing == index:
+        join_form = None
+    wizard.refresh()
+
+
+def _cancel_join_edit() -> None:
+    global join_form
+
+    join_form = None
+    wizard.refresh()
+
+
+def _join_form(table: Table) -> None:
+    draft = join_form_for(table)
+    names = [item.name for item in workspace.tables]
+
+    ui.label("Название").classes("field-label q-mt-md")
+    ui.input(
+        value=draft.name, on_change=lambda e: setattr(draft, "name", e.value)
+    ).props("outlined dense").classes("w-full q-mt-xs")
+    ui.label(JOIN_HELP).classes("hint q-mt-xs")
+
+    for index, link in enumerate(draft.links):
+        with ui.element("div").classes("record"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.label(f"звено {index + 1}").classes("field-label")
+                ui.space()
+                if len(draft.links) > 1:
+                    ui.button(
+                        "Убрать",
+                        on_click=lambda i=index: _remove_link(i),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn danger")
+
+            with ui.row().classes("w-full items-center gap-2 no-wrap q-mt-xs"):
+                ui.select(
+                    list(JOIN_TYPES),
+                    value=link.type,
+                    on_change=lambda e, l=link: setattr(l, "type", e.value),
+                ).props("outlined dense").classes("w-32")
+                ui.select(
+                    names,
+                    value=link.table or None,
+                    on_change=lambda e, l=link: _set_link_table(draft, l, table, e.value),
+                ).props("outlined dense").classes("grow")
+                ui.input(
+                    value=link.alias,
+                    placeholder="алиас",
+                    on_change=lambda e, l=link: setattr(l, "alias", e.value),
+                ).props("outlined dense").classes("w-32")
+
+            ui.label("ON").classes("field-label q-mt-sm")
+            ui.textarea(
+                value=link.on,
+                on_change=lambda e, l=link: setattr(l, "on", e.value),
+            ).props("outlined dense autogrow").classes("w-full q-mt-xs")
+            ui.label(
+                f"Условие пишется руками. Своя таблица в нём — "
+                f"{ident(table.short_name)}, приджойненная — под своим алиасом."
+            ).classes("hint q-mt-xs")
+
+    with ui.row().classes("w-full q-mt-sm"):
+        ui.button("Добавить таблицу", on_click=_add_link, color=None).props(
+            "flat no-caps dense"
+        ).classes("crud-btn")
+
+    if draft.error:
+        ui.label(draft.error).classes("error-text q-mt-sm")
+
+    with ui.row().classes("w-full justify-end q-mt-md"):
+        if draft.editing is not None:
+            ui.button(
+                "Отменить правку", on_click=_cancel_join_edit, color=None
+            ).props("flat no-caps").classes("btn-secondary")
+        ui.button(
+            "Сохранить" if draft.editing is not None else "Добавить",
+            on_click=lambda: _submit_join(table),
+            color=None,
+        ).props("unelevated no-caps").classes("btn-primary")
+
+
+def _join_list(table: Table) -> None:
+    """Добавленные цепочки этой таблицы — звеньями, в порядке соединения."""
+    chains = joins_of(workspace.settings, table.name)
+    if not chains:
+        return
+
+    with ui.element("div").classes("card"):
+        ui.label(f"Добавленные join'ы · {len(chains)}").classes("field-label")
+
+        for index, chain in enumerate(chains):
+            editing = join_form is not None and join_form.editing == index
+            with ui.element("div").classes("record editing" if editing else "record"):
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.label(chain.get(NAME_KEY, "")).classes("table-name")
+                    ui.space()
+                    ui.button(
+                        "Редактировать",
+                        on_click=lambda i=index: _edit_join(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn")
+                    ui.button(
+                        "Скопировать",
+                        on_click=lambda i=index: _copy_join(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn")
+                    ui.button(
+                        "Удалить",
+                        on_click=lambda i=index: _remove_join(i, table),
+                        color=None,
+                    ).props("flat no-caps dense").classes("crud-btn danger")
+
+                for link in chain.get(LINKS_KEY) or []:
+                    with ui.element("div").classes("record-row"):
+                        ui.label(
+                            f"{link.get(JOIN_TYPE_KEY)} JOIN "
+                            f"{link.get(JOIN_TABLE_KEY)} {link.get(JOIN_ALIAS_KEY)}"
+                        ).classes("hint")
+                        ui.label(f"ON {link.get(JOIN_ON_KEY)}").classes("record-value")
 
 
 def _finish_row() -> None:
@@ -2461,4 +3067,4 @@ def build() -> None:
                     # Размеры проставлены явно, чтобы высота подвала была известна
                     # до загрузки картинки и страница не дёргалась при отрисовке.
                     ui.html(f'<img class="app-logo" src="{MASCOT}" width="62" height="59" alt="">')
-                    ui.label("SG BUDDY · SELF-HOSTED · SELF-BI · КОГДА ПСУ ДЕЛАТЬ НЕЧЕГО").classes("footer-copy")
+                    ui.label("SG BUDDY · SELF-HOSTED · КОГДА ПСУ ДЕЛАТЬ НЕЧЕГО").classes("footer-copy")

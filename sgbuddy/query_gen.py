@@ -32,6 +32,17 @@
   есть всегда**, даже когда не отмечено ничего, — иначе постраничная выборка
   начинает повторять и терять строки. Счётчику страниц сортировка не достаётся:
   считать она не помогает, а параметры бы добавила;
+* join'ы берутся из раздела `JOINS`: выборка называет цепочки, они
+  разворачиваются в строки `LEFT JOIN таблица алиас ON ...` по порядку звеньев,
+  а условие `ON` идёт в файл ровно так, как написано руками. Колонка
+  приджойненной таблицы выходит под именем с алиасом — `o.id AS o_id`: двух
+  одинаковых имён в результате sqlc не примет. Это же имя носит её параметр
+  (`@o_id`) и по нему же её выбирает сортировка. Столкнуться имена могут и
+  после алиаса — своя колонка `alias_id` и `alias.id` приджойненной, — тогда
+  второе получает номер (`alias_id_2`) и тоже уходит под ним через `AS`.
+  Выборка с join'ом обязана перечислить колонки: `SELECT *` вернул бы столбцы
+  всех таблиц вперемешку, поэтому запрос без единой отмеченной колонки
+  пропускается;
 * режим удаления решает, что за запрос получится: `DELETE` даёт `DELETE FROM`,
   `SOFT DELETE` и `UNDELETE` — одинаковый `UPDATE ... SET`. Обратное удаление
   отличается от мягкого только значениями, которые автор написал колонкам;
@@ -50,7 +61,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from .ddl import Table
+from .ddl import Column, Table
 from .settings import (
     ANNOTATION_KEY,
     COLUMN_NAME_KEY,
@@ -60,6 +71,13 @@ from .settings import (
     CUSTOM_QUERY_KEY,
     CUSTOM_WHERE_KEY,
     EXACT_WHERE_KEY,
+    JOIN_ALIAS_KEY,
+    JOIN_NAME_KEY,
+    JOIN_ON_KEY,
+    JOIN_TABLE_KEY,
+    JOIN_TYPE_KEY,
+    JOINED_COLUMNS_KEY,
+    LINKS_KEY,
     MODE_KEY,
     NAME_KEY,
     ORDER_BY_KEY,
@@ -68,9 +86,11 @@ from .settings import (
     SET_KEY,
     SET_VALUE_KEY,
     SHOW_KEY,
+    USED_JOINS_KEY,
     WHERE_KEY,
     WHERE_OPTIONAL_KEY,
     WHERE_VALUE_KEY,
+    join_by_name,
 )
 
 QUERY_FILENAME = "query.sql"
@@ -89,6 +109,14 @@ _TABLE_RULE = "-- " + "=" * 57
 SOFT_DELETE = "SOFT DELETE"
 UNDELETE = "UNDELETE"
 SET_MODES = (SOFT_DELETE, UNDELETE)
+
+# Виды соединения. `INNER` первым: это же соединение по умолчанию у самого
+# Postgres, когда слово перед JOIN не написано.
+JOIN_TYPES = ("INNER", "LEFT", "RIGHT", "FULL")
+# Соединения, которые оставляют пустой приджойненную сторону, и те, что оставляют
+# пустой свою. `FULL` делает и то и другое.
+_OUTER_JOINED = ("LEFT", "FULL")
+_OUTER_OWN = ("RIGHT", "FULL")
 
 # Аннотация по умолчанию, если её нет в настройках (у DELETE её нет вовсе).
 DEFAULT_ANNOTATION = {"CREATE": "exec", "READ": "many", "UPDATE": "exec", "DELETE": "exec"}
@@ -180,6 +208,41 @@ class Ordering:
 
 
 @dataclass(frozen=True)
+class Join:
+    """Звено цепочки: приджойненная таблица под своим алиасом и условие `ON`.
+
+    Условие написано руками и в SQL идёт как есть: разбирать чужой текст,
+    чтобы что-то в нём поправить, — гадание, а гадать здесь нельзя.
+    """
+
+    type: str
+    table: Table
+    alias: str
+    on: str
+
+
+@dataclass(frozen=True)
+class Field:
+    """Колонка выборки: чем она является в SQL и как называется на выходе.
+
+    Своя колонка выходит под своим именем (`id`), колонка приджойненной
+    таблицы — под именем с алиасом (`o_id`): в одной выборке встречаются
+    `id` обеих таблиц, а двух одинаковых имён в результате sqlc не примет.
+    Это же имя становится именем параметра — `@o_id`.
+    """
+
+    ref: str
+    out: str
+    column: Column
+    # Настройки этой колонки: show/where/order_by и прочие флаги записи.
+    flags: dict
+    # Строка может не найтись: колонка приходит со стороны join'а, которую
+    # внешнее соединение вправе оставить пустой. На SQL это не влияет, но
+    # контракту знать обязательно.
+    outer: bool = False
+
+
+@dataclass(frozen=True)
 class Param:
     """Параметр готового запроса: имя, приведение типа из SQL, обязательность."""
 
@@ -260,6 +323,17 @@ def ident(name: str) -> str:
     return ".".join(parts)
 
 
+def is_alias(name: str) -> bool:
+    """Годится ли строка в алиас приджойненной таблицы.
+
+    Правило одно на программу: из алиаса собираются имена колонок выборки и
+    параметров (`o_id`, `@o_id`), а они обязаны быть простыми идентификаторами —
+    `@"my alias_id"` не бывает.
+    """
+    name = (name or "").strip()
+    return bool(_SIMPLE_NAME.match(name)) and name not in RESERVED
+
+
 def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
     """Собирает текст `query.sql`. Проблемные запросы пропускает, но называет."""
     by_name = {table.name: table for table in tables}
@@ -280,7 +354,16 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
         of_table: list[str] = []
         for direction in ("CREATE", "READ", "UPDATE", "DELETE"):
             for entry in directions.get(direction) or []:
-                block = entry_sql(direction, entry, table, taken, problems)
+                # Цепочки разбираем здесь, а не внутри сборки: их же читает
+                # генератор контракта, и оба обязаны видеть одни и те же звенья.
+                joins: list[Join] = []
+                if direction == "READ":
+                    resolved = read_joins(entry, table, settings, by_name, problems)
+                    if resolved is None:
+                        continue
+                    joins = resolved
+
+                block = entry_sql(direction, entry, table, taken, problems, joins=joins)
                 if block:
                     of_table.append(block)
 
@@ -332,7 +415,13 @@ def query_names(settings: dict) -> set[str]:
 
 
 def entry_sql(
-    direction: str, entry: dict, table: Table, taken: set[str], problems: list[Problem]
+    direction: str,
+    entry: dict,
+    table: Table,
+    taken: set[str],
+    problems: list[Problem],
+    *,
+    joins: list[Join] = (),
 ) -> str | None:
     name = (entry.get(NAME_KEY) or "").strip()
     if not name:
@@ -361,7 +450,7 @@ def entry_sql(
     # Занятые имена нужны только выборке — она одна порождает второй запрос.
     builders = {
         "CREATE": _create_sql,
-        "READ": partial(_read_sql, taken=taken),
+        "READ": partial(_read_sql, taken=taken, joins=joins),
         "UPDATE": _update_sql,
         "DELETE": _delete_sql,
     }
@@ -400,10 +489,25 @@ def _read_sql(
     problems: list[Problem],
     *,
     taken: set[str],
+    joins: list[Join] = (),
 ) -> str | None:
-    columns = entry.get(COLUMNS_KEY) or []
+    fields = read_fields(entry, table, joins)
+    shown = [item for item in fields if item.flags.get(SHOW_KEY)]
 
-    shown = [col[COLUMN_NAME_KEY] for col in columns if col.get(SHOW_KEY)]
+    if not shown and joins:
+        # `SELECT *` вернул бы колонки всех соединённых таблиц вперемешку и с
+        # повторяющимися именами — такой файл sqlc не примет. Угадывать, что из
+        # них нужно, нечем: пропускаем запрос и называем причину.
+        problems.append(
+            Problem(
+                table.name,
+                name,
+                "join есть, а колонки не отмечены: SELECT * дал бы "
+                "повторяющиеся имена колонок",
+            )
+        )
+        return None
+
     if not shown:
         problems.append(
             Problem(table.name, name, "не отмечена ни одна колонка — берём все", fatal=False)
@@ -412,17 +516,27 @@ def _read_sql(
     if shown:
         body = [
             "SELECT",
-            "    " + ",\n    ".join(field(table, column) for column in shown),
+            "    " + ",\n    ".join(_selected(item) for item in shown),
         ]
     else:
         body = ["SELECT *"]
 
-    where = _where_block(entry, table, EXACT_WHERE_KEY)
+    where = _where_lines(
+        _conditions(fields, EXACT_WHERE_KEY) + _custom_conditions(entry)
+    )
     body.append(f"FROM {ident(table.name)}")
+    body += _join_lines(joins)
     body += where
     # Сортировка идёт после условий и до постраничности — иначе Postgres не
     # примет запрос, а страницы резались бы до упорядочивания.
-    body += _order_block(entry, table, name, problems, always=annotation == "many")
+    body += _order_block(
+        fields,
+        table,
+        name,
+        problems,
+        always=annotation == "many",
+        paged=bool(entry.get(PAGINATION_KEY)),
+    )
 
     if annotation == "one":
         body.append("LIMIT 1")
@@ -451,7 +565,7 @@ def _read_sql(
         )
         return listing
 
-    return listing + "\n" + _count_block(count_name, table, where)
+    return listing + "\n" + _count_block(count_name, table, joins, where)
 
 
 def _update_sql(
@@ -525,6 +639,170 @@ def _delete_sql(
 # ---------------------------------------------------------------- части запроса
 
 
+def read_joins(
+    entry: dict,
+    table: Table,
+    settings: dict,
+    by_name: dict[str, Table],
+    problems: list[Problem],
+) -> list[Join] | None:
+    """Звенья цепочек, включённых в выборку. `None` — собрать нельзя.
+
+    Ничего не чинит на ходу: цепочка, у которой пропала таблица или разъехались
+    алиасы, останавливает сборку этого запроса. Собрать его «как получится»
+    значило бы отдать наружу выборку не того состава, каким она описана.
+    """
+    query = (entry.get(NAME_KEY) or "—").strip()
+    links: list[Join] = []
+    # Алиасы не должны сталкиваться ни между собой, ни с именем своей таблицы:
+    # `FROM dc."user" ... JOIN dc.role "user"` Postgres не примет.
+    aliases = {table.short_name}
+
+    def failed(message: str) -> None:
+        problems.append(Problem(table.name, query, message))
+
+    for chain_name in entry.get(USED_JOINS_KEY) or []:
+        chain = join_by_name(settings, table.name, chain_name)
+        if chain is None:
+            failed(f"join {chain_name!r} у таблицы не описан")
+            return None
+
+        for link in chain.get(LINKS_KEY) or []:
+            joined = by_name.get(link.get(JOIN_TABLE_KEY) or "")
+            if joined is None:
+                failed(
+                    f"join {chain_name!r}: таблицы "
+                    f"{link.get(JOIN_TABLE_KEY)!r} нет в схеме"
+                )
+                return None
+
+            kind = (link.get(JOIN_TYPE_KEY) or JOIN_TYPES[0]).strip().upper()
+            if kind not in JOIN_TYPES:
+                failed(f"join {chain_name!r}: неизвестный вид соединения {kind!r}")
+                return None
+
+            alias = (link.get(JOIN_ALIAS_KEY) or "").strip()
+            if not is_alias(alias):
+                failed(
+                    f"join {chain_name!r}: алиас {alias!r} не годится — из него "
+                    "собираются имена колонок и параметров"
+                )
+                return None
+            if alias in aliases:
+                failed(f"join {chain_name!r}: алиас {alias!r} уже занят")
+                return None
+
+            on = (link.get(JOIN_ON_KEY) or "").strip()
+            if not on:
+                failed(f"join {chain_name!r}: звено {alias!r} без условия ON")
+                return None
+
+            aliases.add(alias)
+            links.append(Join(type=kind, table=joined, alias=alias, on=on))
+
+    by_alias = {link.alias: link for link in links}
+    for col in entry.get(JOINED_COLUMNS_KEY) or []:
+        link = by_alias.get(col.get(JOIN_ALIAS_KEY) or "")
+        if link is None or link.table.column(col.get(COLUMN_NAME_KEY)) is None:
+            # Настройки колонок разошлись с цепочкой: у звена сменили алиас или
+            # таблицу. Выкинуть колонку молча — отдать другую выборку под тем же
+            # именем, поэтому пропускаем запрос целиком.
+            failed(
+                f"колонка {col.get(JOIN_ALIAS_KEY)}.{col.get(COLUMN_NAME_KEY)} "
+                "не сходится с join'ами запроса"
+            )
+            return None
+
+    return links
+
+
+def read_fields(entry: dict, table: Table, joins: list[Join] = ()) -> list[Field]:
+    """Колонки выборки: сперва свои, потом приджойненные — в порядке звеньев."""
+    # `RIGHT` и `FULL` сохраняют приджойненную сторону, а свою вправе оставить
+    # пустой: тогда пустыми приходят колонки собственной таблицы.
+    own_outer = any(link.type in _OUTER_OWN for link in joins)
+    # Имена на выходе не должны повторяться, поэтому собираем их по ходу: см.
+    # `_unique_out`.
+    taken: set[str] = set()
+
+    fields: list[Field] = []
+    for col in entry.get(COLUMNS_KEY) or []:
+        column = table.column(col.get(COLUMN_NAME_KEY))
+        if column is None:
+            continue
+        fields.append(
+            Field(
+                ref=field(table, column.name),
+                out=_unique_out(column.name, taken),
+                column=column,
+                flags=col,
+                outer=own_outer,
+            )
+        )
+
+    written = {
+        (col.get(JOIN_ALIAS_KEY) or "", col.get(COLUMN_NAME_KEY) or ""): col
+        for col in entry.get(JOINED_COLUMNS_KEY) or []
+    }
+    for link in joins:
+        for column in link.table.columns:
+            flags = written.get((link.alias, column.name))
+            if flags is None:
+                continue
+            fields.append(
+                Field(
+                    ref=f"{ident(link.alias)}.{ident(column.name)}",
+                    out=_unique_out(f"{link.alias}_{column.name}", taken),
+                    column=column,
+                    flags=flags,
+                    outer=link.type in _OUTER_JOINED,
+                )
+            )
+    return fields
+
+
+def _unique_out(name: str, taken: set[str]) -> str:
+    """Имя на выходе, которого в этой выборке ещё не было.
+
+    Двух одинаковых имён в `SELECT` sqlc не примет, а совпасть они могут и
+    после алиаса: у `dc.column_cat` есть своя колонка `alias_id`, и звено с
+    алиасом `alias` даёт `alias.id AS alias_id` — то же самое имя. Второму
+    вхождению приписываем номер (`alias_id_2`), и в файл оно уходит под ним
+    же через `AS`.
+
+    Номер получает именно второе вхождение, а не оба: имя первого — то, что
+    выборка возвращала до появления двойника, и менять его значило бы
+    переименовать поле, которого спор не касается.
+    """
+    unique = name
+    number = 2
+    while unique in taken:
+        unique = f"{name}_{number}"
+        number += 1
+    taken.add(unique)
+    return unique
+
+
+def _selected(item: Field) -> str:
+    """Колонка в списке выборки. Имя на выходе задаём, только если оно другое."""
+    if item.out == item.column.name:
+        return item.ref
+    return f"{item.ref} AS {ident(item.out)}"
+
+
+def _join_lines(joins: list[Join]) -> list[str]:
+    """Строки `LEFT JOIN таблица алиас ON ...` — по строке на звено."""
+    lines = []
+    for link in joins:
+        # Условие могли скопировать из готового запроса — вместе с ведущим `ON`
+        # и точкой с запятой; иначе в файл ушло бы `ON ON ...`.
+        on = re.sub(r"(?i)^on\s+", "", link.on.rstrip(";").strip())
+        lines.append(
+            f"{link.type} JOIN {ident(link.table.name)} {ident(link.alias)} ON {on}"
+        )
+    return lines
+
+
 def _value(written: str | None, column: str) -> str:
     """Заполненное значение идёт в SQL как есть, пустое — параметром."""
     written = (written or "").strip()
@@ -543,13 +821,16 @@ def field(table: Table, column: str) -> str:
     return f"{ident(table.short_name)}.{ident(column)}"
 
 
-def ordering(entry: dict, table: Table, *, always: bool) -> Ordering:
-    """Что и в каком порядке сортирует выборка. Правило одно на SQL и контракт."""
-    columns = entry.get(COLUMNS_KEY) or []
+def ordering(fields: list[Field], table: Table, *, always: bool) -> Ordering:
+    """Что и в каком порядке сортирует выборка. Правило одно на SQL и контракт.
+
+    Названы колонки именами выхода (`o_id`, не `id`): по этим же именам
+    вызывающий выбирает сортировку параметром `order_by`.
+    """
     optional = tuple(
-        col[COLUMN_NAME_KEY] for col in columns if col.get(ORDER_BY_OPTIONAL_KEY)
+        item.out for item in fields if item.flags.get(ORDER_BY_OPTIONAL_KEY)
     )
-    plain = tuple(col[COLUMN_NAME_KEY] for col in columns if col.get(ORDER_BY_KEY))
+    plain = tuple(item.out for item in fields if item.flags.get(ORDER_BY_KEY))
 
     if not optional and not plain:
         # У выборки списка порядок обязателен: без него постраничность начинает
@@ -562,7 +843,13 @@ def ordering(entry: dict, table: Table, *, always: bool) -> Ordering:
 
 
 def _order_block(
-    entry: dict, table: Table, query: str, problems: list[Problem], *, always: bool
+    fields: list[Field],
+    table: Table,
+    query: str,
+    problems: list[Problem],
+    *,
+    always: bool,
+    paged: bool = False,
 ) -> list[str]:
     """Строки `ORDER BY ...`.
 
@@ -586,11 +873,13 @@ def _order_block(
     постраничной выборки без единой отмеченной колонки сортировки это ещё и
     предупреждение: колонка для сортировки взята наугад, а не осознанно.
     """
-    columns = entry.get(COLUMNS_KEY) or []
     if (
         always
-        and entry.get(PAGINATION_KEY)
-        and not any(col.get(ORDER_BY_KEY) or col.get(ORDER_BY_OPTIONAL_KEY) for col in columns)
+        and paged
+        and not any(
+            item.flags.get(ORDER_BY_KEY) or item.flags.get(ORDER_BY_OPTIONAL_KEY)
+            for item in fields
+        )
     ):
         problems.append(
             Problem(
@@ -602,23 +891,29 @@ def _order_block(
             )
         )
 
-    order = ordering(entry, table, always=always)
+    order = ordering(fields, table, always=always)
     if order.default is None:
         return []
 
+    # Колонка порядка по умолчанию берётся из DDL и своего поля выборки может не
+    # иметь — тогда ссылку собираем сами, как для любой своей колонки.
+    refs = {item.out: item.ref for item in fields}
+
     terms: list[str] = []
     for column in order.optional:
-        terms.append(_order_term(table, column, selectable=True, reverse=False))
-        terms.append(_order_term(table, column, selectable=True, reverse=True))
+        ref = refs.get(column) or field(table, column)
+        terms.append(_order_term(ref, column, selectable=True, reverse=False))
+        terms.append(_order_term(ref, column, selectable=True, reverse=True))
     for column in order.plain:
-        terms.append(_order_term(table, column, selectable=False, reverse=False))
-        terms.append(_order_term(table, column, selectable=False, reverse=True))
+        ref = refs.get(column) or field(table, column)
+        terms.append(_order_term(ref, column, selectable=False, reverse=False))
+        terms.append(_order_term(ref, column, selectable=False, reverse=True))
 
     lines = [f"{term}," for term in terms[:-1]] + [terms[-1]]
     return [f"ORDER BY {lines[0]}"] + [f"    {line}" for line in lines[1:]]
 
 
-def _order_term(table: Table, column: str, *, selectable: bool, reverse: bool) -> str:
+def _order_term(ref: str, column: str, *, selectable: bool, reverse: bool) -> str:
     """Одна ветка сортировки: своя колонка, своё направление, свой `CASE`.
 
     Ветка возрастания срабатывает не на точное `= 'ASC'`, а на
@@ -634,57 +929,73 @@ def _order_term(table: Table, column: str, *, selectable: bool, reverse: bool) -
     if selectable:
         cond = f"{cond} AND {ORDER_TEXT_PARAM} = '{column}'"
     direction = "DESC" if reverse else "ASC"
-    return f"CASE WHEN {cond} THEN {field(table, column)} END {direction}"
+    return f"CASE WHEN {cond} THEN {ref} END {direction}"
 
 
 def _where_block(entry: dict, table: Table, value_key: str) -> list[str]:
-    """Строки `WHERE ...` / `  AND ...` — или пустой список, если условий нет."""
+    """Строки условий запроса без join'ов — изменения и удаления."""
+    return _where_lines(
+        _conditions(read_fields(entry, table), value_key) + _custom_conditions(entry)
+    )
+
+
+def _conditions(fields: list[Field], value_key: str) -> list[str]:
+    """Условия по колонкам. Имя параметра — имя колонки на выходе, не в таблице."""
     conditions: list[str] = []
 
-    for col in entry.get(COLUMNS_KEY) or []:
-        name = col[COLUMN_NAME_KEY]
-        written = (col.get(value_key) or "").strip()
+    for item in fields:
+        written = (item.flags.get(value_key) or "").strip()
 
-        if col.get(WHERE_KEY):
-            conditions.append(f"{field(table, name)} = {written or f'@{name}'}")
-        elif col.get(WHERE_OPTIONAL_KEY):
+        if item.flags.get(WHERE_KEY):
+            conditions.append(f"{item.ref} = {written or f'@{item.out}'}")
+        elif item.flags.get(WHERE_OPTIONAL_KEY):
             # Необязательный фильтр: параметр либо задан, либо условие не работает.
             # Приведение типа нужно, чтобы sqlc не гадал тип sqlc.narg.
-            param = written or f"sqlc.narg('{name}')"
-            column = table.column(name)
-            cast = f"::{column.sql_type}" if column is not None else ""
+            param = written or f"sqlc.narg('{item.out}')"
             conditions.append(
-                f"({param}{cast} IS NULL OR {field(table, name)} = {param})"
+                f"({param}::{item.column.sql_type} IS NULL OR {item.ref} = {param})"
             )
         elif value_key == EXACT_WHERE_KEY and written:
             # EXACT WHERE — самостоятельное условие в READ: колонка не отмечена
             # ни WHERE, ни WHERE OPTIONAL, но значение всё равно должно попасть
             # в запрос через AND, а не молча потеряться.
-            conditions.append(f"{field(table, name)} = {written}")
+            conditions.append(f"{item.ref} = {written}")
 
+    return conditions
+
+
+def _custom_conditions(entry: dict) -> list[str]:
+    """Условие, написанное руками, — одним элементом или ни одного."""
     custom = (entry.get(CUSTOM_WHERE_KEY) or "").strip()
-    if custom:
-        # Автор мог вписать условие, скопированное из готового запроса, —
-        # вместе с ведущим WHERE и конечной точкой с запятой. Срезаем их,
-        # иначе внутри скобок получится `(WHERE ...;)`.
-        custom = custom.rstrip(";").strip()
-        custom = re.sub(r"(?i)^where\s+", "", custom)
-        # В скобках: своё условие может содержать OR и молча расширить выборку.
-        conditions.append(f"({custom})")
+    if not custom:
+        return []
 
+    # Автор мог вписать условие, скопированное из готового запроса, — вместе с
+    # ведущим WHERE и конечной точкой с запятой. Срезаем их, иначе внутри
+    # скобок получится `(WHERE ...;)`.
+    custom = custom.rstrip(";").strip()
+    custom = re.sub(r"(?i)^where\s+", "", custom)
+    # В скобках: своё условие может содержать OR и молча расширить выборку.
+    return [f"({custom})"]
+
+
+def _where_lines(conditions: list[str]) -> list[str]:
+    """`WHERE ...` / `  AND ...` — или пустой список, если условий нет."""
     if not conditions:
         return []
 
     return [f"WHERE {conditions[0]}"] + [f"  AND {rest}" for rest in conditions[1:]]
 
 
-def _count_block(name: str, table: Table, where: list[str]) -> str:
+def _count_block(
+    name: str, table: Table, joins: list[Join], where: list[str]
+) -> str:
     """`CountИмяЗапроса :one` — сколько всего строк и страниц у той же выборки.
 
     Размер страницы называется `@page_limit`, как в самой выборке: параметр по
     смыслу тот же, и вызывающему коду не приходится помнить второе имя.
     """
-    body = [*_COUNT_SELECT, f"FROM {ident(table.name)}", *where]
+    body = [*_COUNT_SELECT, f"FROM {ident(table.name)}", *_join_lines(joins), *where]
     return _block(name, "one", body)
 
 

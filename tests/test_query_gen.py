@@ -7,7 +7,7 @@ import pytest
 from sgbuddy import query_gen
 from sgbuddy.query_gen import GenerationError, Param
 
-from .conftest import col, crud, entry
+from .conftest import chain, col, crud, entry, jcol, link, table_named, with_joins
 
 
 def build(table, direction, *entries, tables=None):
@@ -245,11 +245,16 @@ def test_optional_order_column_is_chosen_by_name(alias):
 
 
 def test_ordering_reports_the_default_key(alias):
-    """`ELSE` — первая обычная колонка сортировки, иначе первая колонка DDL."""
-    marked = entry("GetAliases", col("name", order_by=True), annotation="many")
-    assert query_gen.ordering(marked, alias, always=True).default == "name"
+    """`ELSE` — первая обычная колонка сортировки, иначе первая колонка DDL.
 
-    empty = entry("GetAliases", annotation="many")
+    Сортировка считается по колонкам выборки, а не по записи настроек: у
+    выборки с join'ом среди них есть и колонки приджойненных таблиц.
+    """
+    marked = entry("GetAliases", col("name", order_by=True), annotation="many")
+    fields = query_gen.read_fields(marked, alias)
+    assert query_gen.ordering(fields, alias, always=True).default == "name"
+
+    empty = query_gen.read_fields(entry("GetAliases", annotation="many"), alias)
     assert query_gen.ordering(empty, alias, always=True).default == "id"
     # У `one` порядка нет вовсе.
     assert query_gen.ordering(empty, alias, always=False).default is None
@@ -514,3 +519,358 @@ def test_generated_file_overwrites_the_old_one(alias, tmp_path):
         crud(alias.name, CREATE=[entry("CreateAlias", col("name"))]), [alias], target
     )
     assert "правки руками" not in target.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------- join'ы
+
+
+@pytest.fixture
+def linked(reference_tables):
+    """Три таблицы, связанные по порядку: колонка -> таблица -> схема."""
+    return [
+        table_named(reference_tables, name)
+        for name in ("dc.column_cat", "dc.table_cat", "dc.schema_cat")
+    ]
+
+
+def joined(table, *entries, chains=(), tables=None):
+    """Текст и проблемы выборок, у которых есть раздел join'ов."""
+    settings = crud(table.name, READ=list(entries))
+    with_joins(settings, table.name, *chains)
+    return query_gen.render(settings, tables)
+
+
+def joined_sql(table, *entries, chains=(), tables=None) -> str:
+    return joined(table, *entries, chains=chains, tables=tables)[0]
+
+
+def with_user(type: str = "LEFT") -> dict:
+    """Цепочка из одного звена: `dc.alias` и её пользователь."""
+    return chain("with_user", link("dc.user", "u", "u.id = alias.user_id", type=type))
+
+
+@pytest.mark.parametrize(
+    ("name", "good"),
+    [
+        ("u", True),
+        ("user_table", True),
+        # Слово SQL: `@user_id` в запросе прочтётся не так, как задумано.
+        ("user", False),
+        ("order", False),
+        # Из алиаса собирается имя параметра — пробелам и кавычкам там не место.
+        ("my alias", False),
+        ("Alias", False),
+        ("", False),
+    ],
+)
+def test_is_alias_allows_only_simple_names(name, good):
+    assert query_gen.is_alias(name) is good
+
+
+def test_chain_turns_into_join_lines(alias, user):
+    """Звено даёт строку `JOIN`, а имя таблицы экранируется как везде."""
+    text = joined_sql(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_user"],
+            joined=[jcol("with_user", "u", "name", show=True)],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert 'FROM dc.alias\nLEFT JOIN dc."user" u ON u.id = alias.user_id' in text
+
+
+def test_links_follow_the_order_of_the_chain(linked):
+    """Связь «многие ко многим» — два звена подряд: связующая и целевая."""
+    columns, tables, schemas = linked
+    text = joined_sql(
+        columns,
+        entry(
+            "GetColumnsWithSchema",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_schema"],
+            joined=[jcol("with_schema", "s", "name", show=True)],
+        ),
+        chains=[
+            chain(
+                "with_schema",
+                link("dc.table_cat", "t", "t.id = column_cat.table_id"),
+                link("dc.schema_cat", "s", "s.id = t.schema_id", type="LEFT"),
+            )
+        ],
+        tables=linked,
+    )
+    assert (
+        "FROM dc.column_cat\n"
+        "INNER JOIN dc.table_cat t ON t.id = column_cat.table_id\n"
+        "LEFT JOIN dc.schema_cat s ON s.id = t.schema_id" in text
+    )
+
+
+def test_joined_column_carries_its_alias_into_the_name(alias, user):
+    """`id` есть у обеих таблиц — двух одинаковых имён sqlc не примет."""
+    text = joined_sql(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_user"],
+            joined=[jcol("with_user", "u", "id", show=True), jcol("with_user", "u", "name", show=True)],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "    alias.id,\n    u.id AS u_id,\n    u.name AS u_name" in text
+
+
+def test_name_taken_after_the_alias_gets_a_number(reference_tables):
+    """`alias.id` даёт `alias_id`, а такая колонка у `dc.column_cat` уже своя."""
+    columns = table_named(reference_tables, "dc.column_cat")
+    aliases = table_named(reference_tables, "dc.alias")
+    text = joined_sql(
+        columns,
+        entry(
+            "GetColumnsWithAlias",
+            col("alias_id", show=True),
+            annotation="many",
+            joins=["with_alias"],
+            joined=[
+                jcol("with_alias", "alias", "id", show=True),
+                jcol("with_alias", "alias", "name", show=True),
+            ],
+        ),
+        chains=[
+            chain("with_alias", link("dc.alias", "alias", "alias.id = column_cat.alias_id"))
+        ],
+        tables=[columns, aliases],
+    )
+    assert (
+        "    column_cat.alias_id,\n"
+        "    alias.id AS alias_id_2,\n"
+        "    alias.name AS alias_name" in text
+    )
+
+
+def test_renamed_column_keeps_its_new_name_everywhere(reference_tables):
+    """Параметр и сортировка зовут колонку тем же именем, что видно в ответе."""
+    columns = table_named(reference_tables, "dc.column_cat")
+    aliases = table_named(reference_tables, "dc.alias")
+    text = joined_sql(
+        columns,
+        entry(
+            "GetColumnsWithAlias",
+            col("alias_id", show=True),
+            annotation="many",
+            joins=["with_alias"],
+            joined=[
+                jcol("with_alias", "alias", "id", show=True, where=True, order_by_optional=True)
+            ],
+        ),
+        chains=[
+            chain("with_alias", link("dc.alias", "alias", "alias.id = column_cat.alias_id"))
+        ],
+        tables=[columns, aliases],
+    )
+    assert "WHERE alias.id = @alias_id_2" in text
+    assert "@order_by::text = 'alias_id_2'" in text
+
+
+def test_column_written_twice_is_aliased_too(alias):
+    """Один и тот же столбец дважды — два одинаковых имени, и sqlc их не примет."""
+    text = sql(
+        alias,
+        "READ",
+        entry(
+            "GetAlias",
+            col("id", show=True),
+            col("id", show=True),
+            annotation="one",
+        ),
+    )
+    assert "SELECT\n    alias.id,\n    alias.id AS id_2\n" in text
+
+
+def test_join_without_marked_columns_is_skipped(alias, user):
+    """`SELECT *` вернул бы колонки обеих таблиц вперемешку — sqlc такое не примет."""
+    text, problems = joined(
+        alias,
+        entry("Plain", col("id", show=True), annotation="one"),
+        entry("Broken", annotation="many", joins=["with_user"]),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "Broken" not in text
+    # Соседний запрос от этого не страдает.
+    assert "-- name: Plain :one" in text
+    assert "колонки не отмечены" in messages(problems)
+    assert [p.fatal for p in problems] == [True]
+
+
+def test_conditions_on_a_joined_column(alias, user):
+    """Параметр называется именем колонки на выходе, а не именем в таблице."""
+    text = joined_sql(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_user"],
+            joined=[
+                jcol("with_user", "u", "id", show=True),
+                jcol("with_user", "u", "name", where=True),
+                jcol("with_user", "u", "external_id", where_optional=True),
+                jcol("with_user", "u", "is_deleted", exact="false"),
+            ],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "WHERE u.name = @u_name" in text
+    assert (
+        "(sqlc.narg('u_external_id')::uuid IS NULL "
+        "OR u.external_id = sqlc.narg('u_external_id'))" in text
+    )
+    assert "u.is_deleted = false" in text
+
+
+def test_ordering_by_a_joined_column(alias, user):
+    """Колонку сортировки вызывающий выбирает тем же именем, что видит в ответе."""
+    text = joined_sql(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_user"],
+            joined=[jcol("with_user", "u", "name", show=True, order_by_optional=True)],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "@order_by::text = 'u_name'" in text
+    assert "THEN u.name END ASC" in text
+
+
+def test_counter_repeats_the_joins_of_its_query(alias, user):
+    """Считать он обязан ту же выборку — иначе страницы не сойдутся со строками."""
+    text = joined_sql(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            col("id", show=True, order_by=True),
+            annotation="many",
+            pagination=True,
+            joins=["with_user"],
+            joined=[jcol("with_user", "u", "name", show=True, where=True)],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    counter = text.split("-- name: CountGetAliasesWithUser :one")[1]
+    assert 'LEFT JOIN dc."user" u ON u.id = alias.user_id' in counter
+    assert "WHERE u.name = @u_name" in counter
+
+
+def test_written_on_goes_into_the_file_as_is(alias, user):
+    """Условие пишут руками: разбирать его и что-то в нём править — гадание."""
+    text = joined_sql(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_user"],
+            joined=[jcol("with_user", "u", "name", show=True)],
+        ),
+        chains=[
+            chain(
+                "with_user",
+                # Условие скопировали из готового запроса — с ведущим ON и `;`.
+                link("dc.user", "u", "ON u.id = alias.user_id AND u.is_deleted = false;"),
+            )
+        ],
+        tables=[alias, user],
+    )
+    assert "INNER JOIN dc.\"user\" u ON u.id = alias.user_id AND u.is_deleted = false\n" in text
+
+
+@pytest.mark.parametrize(
+    ("chains", "used", "expected"),
+    [
+        ([], ["with_user"], "не описан"),
+        (
+            [chain("with_user", link("dc.нет_такой", "u", "u.id = alias.user_id"))],
+            ["with_user"],
+            "нет в схеме",
+        ),
+        (
+            [chain("with_user", link("dc.user", "user", "u.id = alias.user_id"))],
+            ["with_user"],
+            "не годится",
+        ),
+        (
+            [chain("with_user", link("dc.user", "alias", "u.id = alias.user_id"))],
+            ["with_user"],
+            "уже занят",
+        ),
+        ([chain("with_user", link("dc.user", "u", "   "))], ["with_user"], "без условия ON"),
+        (
+            [chain("with_user", link("dc.user", "u", "u.id = alias.user_id", type="OUTER"))],
+            ["with_user"],
+            "неизвестный вид соединения",
+        ),
+    ],
+)
+def test_broken_chain_stops_its_query_and_says_why(alias, user, chains, used, expected):
+    text, problems = joined(
+        alias,
+        entry("Plain", col("id", show=True), annotation="one"),
+        entry(
+            "Broken",
+            col("id", show=True),
+            annotation="many",
+            joins=used,
+            joined=[jcol("with_user", "u", "name", show=True)],
+        ),
+        chains=chains,
+        tables=[alias, user],
+    )
+    assert "Broken" not in text
+    assert "-- name: Plain :one" in text
+    assert expected in messages(problems)
+
+
+def test_columns_that_no_longer_match_the_chain_stop_the_query(alias, user):
+    """У звена сменили алиас: выкинуть колонку молча — отдать другую выборку."""
+    text, problems = joined(
+        alias,
+        entry("Plain", col("id", show=True), annotation="one"),
+        entry(
+            "Broken",
+            col("id", show=True),
+            annotation="many",
+            joins=["with_user"],
+            # Цепочка знает алиас `u`, а колонка записана на прежний `usr`.
+            joined=[jcol("with_user", "usr", "name", show=True)],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "Broken" not in text
+    assert "-- name: Plain :one" in text
+    assert "не сходится с join" in messages(problems)
+
+
+def test_query_without_joins_is_built_exactly_as_before(alias, user):
+    """Раздел join'ов не должен менять выборки, которые его не используют."""
+    plain = entry("GetAliases", col("id", show=True), annotation="many")
+    text = joined_sql(alias, plain, chains=[with_user()], tables=[alias, user])
+    assert "JOIN" not in text
+    assert text == sql(alias, "READ", plain)
+

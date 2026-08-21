@@ -62,6 +62,27 @@ WHERE_VALUE_KEY = "where_value"
 # Ключи удаления (DELETE): физическое или мягкое.
 MODE_KEY = "Mode"
 
+# Раздел с join'ами: JOINS -> таблица -> именованные цепочки. Лежит рядом с
+# CRUD, а не внутри него: цепочка описывает связи таблицы, а не запрос, и одну
+# и ту же цепочку включают в себя несколько выборок.
+JOINS_KEY = "JOINS"
+# Звенья цепочки — по звену на приджойненную таблицу, в порядке соединения.
+# Имя ключа то же, что у списка включённых цепочек в READ ниже: и там и там
+# `joins` читается как «из чего собран join», а спутать их негде — разделы разные.
+LINKS_KEY = "joins"
+JOIN_TYPE_KEY = "type"
+JOIN_TABLE_KEY = "table"
+JOIN_ALIAS_KEY = "alias"
+JOIN_ON_KEY = "on"
+
+# Что от join'ов попадает в запись READ: имена включённых цепочек и колонки
+# приджойненных таблиц. Колонки лежат отдельным списком, а не в `columns`:
+# там `column_name` читается как имя колонки своей таблицы, и `id` базовой
+# перестал бы отличаться от `id` приджойненной.
+USED_JOINS_KEY = "joins"
+JOINED_COLUMNS_KEY = "joined_columns"
+JOIN_NAME_KEY = "join"
+
 
 def directions_of(settings: dict, table: str) -> dict:
     """Направления таблицы для чтения. Настройки не трогает."""
@@ -82,6 +103,28 @@ def ensure_directions(settings: dict, table: str) -> dict:
     for direction in DIRECTIONS:
         section.setdefault(direction, [])
     return section
+
+
+def joins_of(settings: dict, table: str) -> list:
+    """Цепочки join'ов таблицы для чтения. Настройки не трогает."""
+    return settings.get(JOINS_KEY, {}).get(table, [])
+
+
+def ensure_joins(settings: dict, table: str) -> list:
+    """Список цепочек таблицы. Заводит его, если его нет.
+
+    Как и `ensure_directions`, вызывается только при записи: от простого
+    просмотра в файле не должен появляться пустой раздел каждой таблицы.
+    """
+    return settings.setdefault(JOINS_KEY, {}).setdefault(table, [])
+
+
+def join_by_name(settings: dict, table: str, name: str) -> dict | None:
+    """Цепочка таблицы по имени. Имена уникальны в пределах таблицы."""
+    for chain in joins_of(settings, table):
+        if (chain.get(NAME_KEY) or "").strip() == name:
+            return chain
+    return None
 
 
 def migrate_crud(settings: dict) -> dict:

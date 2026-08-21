@@ -28,6 +28,10 @@
   `total_items`/`total_pages` берутся из парного счётчика `Count<имя>`;
 * выборка с явным списком колонок получает своё сообщение строки `<Имя>Row` —
   в ответе должно быть видно ровно то, что выгружается, а не вся таблица;
+  выборка с join'ом получает его всегда: строка собрана из нескольких таблиц, и
+  сообщением одной таблицы её не описать. Поля приджойненных колонок называются
+  так же, как колонки запроса, — с алиасом (`o_id`), и объявляются `optional`,
+  когда соединение вправе не дать строки (`LEFT`, `FULL`);
 * сортировка: выбираемая колонка и направление приходят готовыми параметрами
   SQL — `order_by` и `order` (оба `string`), — тип берётся из приведения в
   запросе, второй раз генератор его не выбирает. `order` принимает ровно
@@ -55,8 +59,6 @@ from .ddl import Column, Table
 from .query_gen import GenerationError, Problem
 from .settings import (
     ANNOTATION_KEY,
-    COLUMN_NAME_KEY,
-    COLUMNS_KEY,
     CRUD_KEY,
     DIRECTIONS,
     GO_PACKAGE_KEY,
@@ -190,13 +192,26 @@ def render(settings: dict, tables: list[Table]) -> tuple[str, list[Problem]]:
             )
             continue
 
-        built = [
-            result
-            for direction in DIRECTIONS
-            for entry in directions.get(direction) or []
-            if (result := _entry(direction, entry, table, taken, index, problems))
-            is not None
-        ]
+        built: list[_Built] = []
+        for direction in DIRECTIONS:
+            for entry in directions.get(direction) or []:
+                # Звенья join'ов разбирает генератор SQL: контракт описывает тот
+                # же запрос и обязан видеть ровно те же соединения.
+                joins: list[query_gen.Join] = []
+                if direction == "READ":
+                    resolved = query_gen.read_joins(
+                        entry, table, settings, by_name, problems
+                    )
+                    if resolved is None:
+                        continue
+                    joins = resolved
+
+                result = _entry(
+                    direction, entry, table, taken, index, problems, joins=joins
+                )
+                if result is not None:
+                    built.append(result)
+
         if not built:
             continue
 
@@ -257,6 +272,7 @@ def _entry(
     taken: set[str],
     index: dict[str, list[tuple[str, Column]]],
     problems: list[Problem],
+    joins: list[query_gen.Join] = (),
 ) -> _Built | None:
     """Сообщения и метод одного запроса. `None` — запрос не собрался в SQL."""
     name = (entry.get(NAME_KEY) or "").strip()
@@ -266,7 +282,7 @@ def _entry(
     # с правилами и все проблемы: предупреждение вроде «постраничность без
     # ORDER BY» относится и к .proto ровно так же, как к query.sql.
     sql_problems: list[Problem] = []
-    sql = query_gen.entry_sql(direction, entry, table, taken, sql_problems)
+    sql = query_gen.entry_sql(direction, entry, table, taken, sql_problems, joins=joins)
     problems.extend(sql_problems)
     if sql is None:
         return None
@@ -277,12 +293,19 @@ def _entry(
     paged = bool(entry.get(PAGINATION_KEY)) and direction == "READ" and annotation == "many"
 
     kind = _kind(direction, entry)
-    # Сортировку спрашиваем у генератора SQL: правило `ELSE` — его, и контракт
+    # Колонки выборки — вместе с приджойненными и их именами на выходе — тоже
+    # считает генератор SQL: в контракте поля обязаны называться так же, как в
+    # запросе, иначе sqlc вернёт одно, а контракт обещает другое.
+    fields = query_gen.read_fields(entry, table, joins) if direction == "READ" else []
+    # Сортировку спрашиваем у него же: правило `ELSE` — его, и контракт
     # обязан называть ту же колонку, что запрос.
-    order = query_gen.ordering(entry, table, always=direction == "READ" and annotation == "many")
-    request = _request(sql, table, name, paged, index, order, problems)
+    order = query_gen.ordering(
+        fields, table, always=direction == "READ" and annotation == "many"
+    )
+    known = {item.out: item.column for item in fields}
+    request = _request(sql, table, name, paged, index, order, problems, known)
     row_type, row_message, uses_row = _row(
-        direction, entry, table, name, annotation, kind, problems
+        direction, table, name, annotation, kind, problems, fields, bool(joins)
     )
     response = _response(row_type, table, annotation, paged)
 
@@ -311,6 +334,7 @@ def _request(
     index: dict[str, list[tuple[str, Column]]],
     order: query_gen.Ordering,
     problems: list[Problem],
+    known: dict[str, Column],
 ) -> list[_Field]:
     """Поля запроса: параметры SQL, а следом — постраничность."""
     fields: list[_Field] = []
@@ -324,7 +348,7 @@ def _request(
         if paged and param.name in PAGE_PARAMS:
             continue
 
-        proto, optional = _param_type(param, table, query, index, problems)
+        proto, optional = _param_type(param, table, query, index, problems, known)
         # У полей выбора колонки и направления по имени не видно, что можно
         # выбрать — это единственные параметры, которым нужна подсказка.
         if param.name == "order_by" and order.optional:
@@ -353,15 +377,19 @@ def _param_type(
     query: str,
     index: dict[str, list[tuple[str, Column]]],
     problems: list[Problem],
+    known: dict[str, Column],
 ) -> tuple[str, bool]:
     """Тип параметра и признак `optional`.
 
-    Порядок источников: своя колонка, потом приведение, написанное в SQL, потом
-    колонка того же имени в других таблицах схемы. Приведение выше чужой колонки
-    намеренно: его автор написал руками именно про этот параметр, а совпадение
-    имён — всего лишь догадка.
+    Порядок источников: колонка выборки, потом приведение, написанное в SQL,
+    потом колонка того же имени в других таблицах схемы. Приведение выше чужой
+    колонки намеренно: его автор написал руками именно про этот параметр, а
+    совпадение имён — всего лишь догадка.
+
+    Колонки выборки знаем поимённо, вместе с приджойненными: параметр `@o_id`
+    ни в одной таблице так не называется — его имя собрано из алиаса.
     """
-    column = table.column(param.name)
+    column = known.get(param.name) or table.column(param.name)
     if column is not None:
         return _column_type(column, table.name, query, problems), (
             param.optional or column.nullable
@@ -434,18 +462,20 @@ def _column_index(tables: list[Table]) -> dict[str, list[tuple[str, Column]]]:
 
 def _row(
     direction: str,
-    entry: dict,
     table: Table,
     query: str,
     annotation: str,
     kind: str,
     problems: list[Problem],
+    fields: list[query_gen.Field] = (),
+    joined: bool = False,
 ) -> tuple[str | None, str | None, bool]:
     """Тип строки ответа: имя сообщения, своё сообщение строки и нужна ли таблица.
 
     `RETURNING *` и `SELECT *` возвращают таблицу целиком — для них годится
-    сообщение таблицы. Выборка с отмеченными колонками возвращает меньше, и
-    описывать её сообщением таблицы значило бы обещать поля, которых не будет.
+    сообщение таблицы. Выборка с отмеченными колонками возвращает меньше, а
+    выборка с join'ом — колонки нескольких таблиц: описывать их сообщением
+    таблицы значило бы обещать поля, которых не будет.
     """
     if not _returns_row(direction, annotation):
         return None, None, False
@@ -454,19 +484,15 @@ def _row(
     if direction != "READ":
         return table_message, None, True
 
-    shown = [
-        col[COLUMN_NAME_KEY]
-        for col in entry.get(COLUMNS_KEY) or []
-        if col.get(SHOW_KEY) and table.column(col[COLUMN_NAME_KEY]) is not None
-    ]
-    if not shown or len(shown) == len(table.columns):
+    shown = [item for item in fields if item.flags.get(SHOW_KEY)]
+    # Выборка с join'ом собирает строку из нескольких таблиц — сообщением
+    # таблицы её не описать, даже когда колонок в ней столько же.
+    if not shown or (not joined and len(shown) == len(table.columns)):
         return table_message, None, True
 
-    fields = [
-        _column_field(table.column(name), table.name, query, problems) for name in shown
-    ]
+    row = [_row_field(item, table.name, query, problems) for item in shown]
     comment = f"{kind} {query}: строка ответа — только отмеченные колонки."
-    return f"{query}Row", _message(f"{query}Row", fields, comment), False
+    return f"{query}Row", _message(f"{query}Row", row, comment), False
 
 
 def _response(
@@ -592,6 +618,17 @@ def _message(name: str, fields: list[_Field], comment: str) -> str:
         lines.append(f"  {prefix}{item.type} {item.name} = {number};")
     lines.append("}")
     return "\n".join(lines)
+
+
+def _row_field(
+    item: query_gen.Field, table_name: str, query: str, problems: list[Problem]
+) -> _Field:
+    """Поле строки выборки. Имя — то же, что у колонки в запросе."""
+    proto = _column_type(item.column, table_name, query, problems)
+    # Внешнее соединение вправе не дать строки: тогда поле приходит пустым, даже
+    # если в своей таблице колонка объявлена NOT NULL.
+    optional = (item.column.nullable or item.outer) and proto != TIMESTAMP
+    return _Field(proto, item.out, optional=optional)
 
 
 def _column_field(

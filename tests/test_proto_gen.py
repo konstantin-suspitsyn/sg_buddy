@@ -8,7 +8,7 @@ from sgbuddy import ddl, proto_gen, query_gen
 from sgbuddy.query_gen import GenerationError
 from sgbuddy.settings import GO_PACKAGE_KEY, PROTO_PACKAGE_KEY
 
-from .conftest import col, crud, entry
+from .conftest import chain, col, crud, entry, jcol, link, with_joins
 
 
 def build(table, direction, *entries, tables=None, **head):
@@ -405,3 +405,162 @@ def test_generate_writes_the_file_and_leaves_no_temporary(alias, tmp_path):
     assert path.read_text(encoding="utf-8").startswith("// Файл сгенерирован")
     assert [p.name for p in target.parent.iterdir()] == ["api.proto"]
     assert problems == []
+
+
+# ---------------------------------------------------------------------- join'ы
+
+
+def joined(table, *entries, chains=(), tables=None):
+    settings = crud(table.name, READ=list(entries))
+    with_joins(settings, table.name, *chains)
+    return proto_gen.render(settings, tables)
+
+
+def joined_proto(table, *entries, chains=(), tables=None) -> str:
+    return joined(table, *entries, chains=chains, tables=tables)[0]
+
+
+def with_user(type: str = "LEFT") -> dict:
+    return chain("with_user", link("dc.user", "u", "u.id = alias.user_id", type=type))
+
+
+def read_with_user(*joined_columns: dict, **rest) -> dict:
+    return entry(
+        "GetAliasesWithUser",
+        col("id", show=True),
+        annotation="many",
+        joins=["with_user"],
+        joined=list(joined_columns),
+        **rest,
+    )
+
+
+def test_join_always_gets_its_own_row_message(alias, user):
+    """Строка собрана из двух таблиц — сообщением одной её не описать."""
+    text = joined_proto(
+        alias,
+        entry(
+            "GetAliasesWithUser",
+            # Отмечены все свои колонки — без join'а это было бы сообщение таблицы.
+            *(col(name, show=True) for name in alias.column_names),
+            annotation="many",
+            joins=["with_user"],
+            joined=[jcol("with_user", "u", "name", show=True)],
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "message GetAliasesWithUserRow {" in text
+    assert "  repeated GetAliasesWithUserRow rows = 1;" in text
+
+
+def test_joined_field_is_named_with_its_alias(alias, user):
+    """Поле зовут так же, как колонку в запросе: контракт и sqlc обязаны сойтись."""
+    text = joined_proto(
+        alias,
+        read_with_user(
+            jcol("with_user", "u", "name", show=True),
+            jcol("with_user", "u", "external_id", show=True),
+        ),
+        chains=[with_user("INNER")],
+        tables=[alias, user],
+    )
+    assert (
+        "message GetAliasesWithUserRow {\n"
+        "  int64 id = 1;\n"
+        "  string u_name = 2;\n"
+        "  string u_external_id = 3;\n"
+        "}" in text
+    )
+
+
+def test_inner_join_does_not_make_fields_optional(alias, user):
+    """`INNER` строку даёт всегда — обещать пустоту не за что."""
+    text = joined_proto(
+        alias,
+        read_with_user(jcol("with_user", "u", "name", show=True)),
+        chains=[with_user("INNER")],
+        tables=[alias, user],
+    )
+    assert "  string u_name = 2;" in text
+
+
+def test_outer_join_makes_the_empty_side_optional(alias, user):
+    """`LEFT` вправе не дать строки: колонка NOT NULL всё равно придёт пустой."""
+    text = joined_proto(
+        alias,
+        read_with_user(jcol("with_user", "u", "name", show=True)),
+        chains=[with_user("LEFT")],
+        tables=[alias, user],
+    )
+    assert "  optional string u_name = 2;" in text
+
+
+def test_right_join_makes_own_columns_optional(alias, user):
+    """`RIGHT` сохраняет приджойненную сторону, а свою вправе оставить пустой."""
+    text = joined_proto(
+        alias,
+        read_with_user(jcol("with_user", "u", "name", show=True)),
+        chains=[with_user("RIGHT")],
+        tables=[alias, user],
+    )
+    assert "  optional int64 id = 1;" in text
+    assert "  string u_name = 2;" in text
+
+
+def test_full_join_makes_both_sides_optional(alias, user):
+    text = joined_proto(
+        alias,
+        read_with_user(jcol("with_user", "u", "name", show=True)),
+        chains=[with_user("FULL")],
+        tables=[alias, user],
+    )
+    assert "  optional int64 id = 1;" in text
+    assert "  optional string u_name = 2;" in text
+
+
+def test_parameter_of_a_joined_column_knows_its_type(alias, user):
+    """`@u_id` так не зовётся ни одна колонка схемы — имя собрано из алиаса."""
+    text, problems = joined(
+        alias,
+        read_with_user(
+            jcol("with_user", "u", "id", where=True),
+            jcol("with_user", "u", "external_id", where_optional=True),
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    # `optional` здесь от самой колонки: `bigserial` объявлен без NOT NULL.
+    # Проверяется тип — со строкой-заглушкой int64 не спутать.
+    assert "  optional int64 u_id = 1;" in text
+    assert "  optional string u_external_id = 2;" in text
+    # Тип нашёлся по колонке звена — гадать по совпадению имён не пришлось.
+    assert "не нашёлся" not in messages(problems)
+
+
+def test_sortable_joined_column_is_listed_in_the_hint(alias, user):
+    """По имени параметра не видно, что можно выбрать, — строка над полем говорит."""
+    text = joined_proto(
+        alias,
+        read_with_user(
+            jcol("with_user", "u", "name", show=True, order_by_optional=True),
+        ),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "// допустимые значения: u_name" in text
+
+
+def test_query_that_did_not_build_is_not_described(alias, user):
+    """Причину называет генератор SQL — контракт просто не описывает такой запрос."""
+    text, problems = joined(
+        alias,
+        entry("Plain", col("id", show=True), annotation="one"),
+        entry("Broken", annotation="many", joins=["with_user"]),
+        chains=[with_user()],
+        tables=[alias, user],
+    )
+    assert "Broken" not in text
+    assert "message PlainRow {" in text
+    assert "колонки не отмечены" in messages(problems)
+
