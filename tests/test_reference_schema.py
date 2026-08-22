@@ -97,6 +97,32 @@ def test_quoted_table_survives_the_whole_path(reference_tables, tmp_path):
     assert 'dc."user".id' not in text
 
 
+def test_key_of_the_reference_is_required_in_the_contract(reference_tables):
+    """`dc."user".id` — `bigserial constraint user_pk primary key`, без `NOT NULL`.
+
+    Ключ не бывает `NULL`, поэтому `optional` ему не полагается: на этой колонке
+    правило и ловится, других таких в эталоне нет.
+    """
+    settings = full_settings(reference_tables)
+    text, _ = proto_gen.render(settings, reference_tables)
+
+    assert "\n".join(("message User {", "  int64 id = 1;")) in text
+    assert "optional int64 id" not in text
+
+
+def test_insert_of_the_key_is_warned_about_in_both_files(reference_tables):
+    """Вставка ждёт `@id` — предупреждают оба генератора, каждый про свой файл."""
+    settings = full_settings(reference_tables)
+    _, query_problems = query_gen.render(settings, reference_tables)
+    _, proto_problems = proto_gen.render(settings, reference_tables)
+
+    for problems in (query_problems, proto_problems):
+        keys = [p for p in problems if "первичный ключ" in p.message]
+        # Ключ в эталоне один — у `dc."user"`, остальные таблицы его не объявляют.
+        assert [p.query for p in keys] == ["CreateUser"]
+        assert all(not p.fatal for p in keys)
+
+
 def test_counter_is_paired_with_every_paginated_query(reference_tables):
     settings = full_settings(reference_tables)
     text, _ = query_gen.render(settings, reference_tables)

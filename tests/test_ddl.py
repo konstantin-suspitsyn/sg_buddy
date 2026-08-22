@@ -46,6 +46,49 @@ def test_nullable_only_without_not_null(alias):
     assert alias.column("updated_at").nullable is True
 
 
+# ------------------------------------------------------ первичный ключ
+
+
+def test_primary_key_is_never_nullable():
+    """`PRIMARY KEY` подразумевает `NOT NULL`, и рядом с ключом его не пишут."""
+    table = parse_one("CREATE TABLE t (id bigint primary key, a int)")
+    assert table.column("id").nullable is False
+    assert table.column("id").is_primary_key is True
+    # Соседняя колонка — как была: правило про ключ, а не про всю таблицу.
+    assert table.column("a").nullable is True
+
+
+def test_named_primary_key_constraint_is_read(user):
+    """У `dc."user"` ключ объявлен как `constraint user_pk primary key`."""
+    assert user.column("id").sql_type == "bigserial"
+    assert user.column("id").nullable is False
+
+
+def test_primary_key_written_as_a_separate_line():
+    """`PRIMARY KEY (id)` строкой — тот же ключ, только другим синтаксисом."""
+    table = parse_one("CREATE TABLE t (id bigint, a int, PRIMARY KEY (id))")
+    assert table.column("id").nullable is False
+    assert table.column("id").is_primary_key is True
+    assert table.column("a").is_primary_key is False
+
+
+def test_composite_primary_key_covers_every_column():
+    table = parse_one(
+        "CREATE TABLE t (a bigint, b bigint, c int, CONSTRAINT t_pk PRIMARY KEY (a, b))"
+    )
+    assert [table.column(name).nullable for name in ("a", "b", "c")] == [
+        False,
+        False,
+        True,
+    ]
+
+
+def test_not_null_primary_key_stays_as_it_was():
+    """Явный `NOT NULL` у ключа ничего не меняет — обязательна и так, и так."""
+    table = parse_one("CREATE TABLE t (id bigint NOT NULL primary key)")
+    assert table.column("id").nullable is False
+
+
 # ------------------------------------------------------------------ типы и длины
 
 

@@ -18,7 +18,10 @@
   приходит из подзапроса по соседней таблице. Не нашлось нигде — `string`
   и строка в проблемах;
 * необязательный фильтр (`sqlc.narg`) и колонка, допускающая `NULL`, дают
-  `optional`-поле;
+  `optional`-поле — и в строке ответа, и в параметрах вызова. Дата не
+  исключение: `optional google.protobuf.Timestamp` в proto3 законен, и `NULL`
+  колонки должен читаться в контракте глазами, а не выводиться из того, что
+  тип оказался сообщением;
 * ответ зависит от аннотации: `exec` — пустое сообщение, `one` — одна строка,
   `many` — `repeated`; у `DELETE` строки нет никогда;
 * **постраничность описывается целиком**: в запрос добавляются `page_limit` и
@@ -361,7 +364,7 @@ def _request(
             _Field(
                 proto,
                 param.name,
-                optional=optional and proto != TIMESTAMP,
+                optional=optional,
                 comment=comment,
             )
         )
@@ -627,7 +630,7 @@ def _row_field(
     proto = _column_type(item.column, table_name, query, problems)
     # Внешнее соединение вправе не дать строки: тогда поле приходит пустым, даже
     # если в своей таблице колонка объявлена NOT NULL.
-    optional = (item.column.nullable or item.outer) and proto != TIMESTAMP
+    optional = item.column.nullable or item.outer
     return _Field(proto, item.out, optional=optional)
 
 
@@ -635,8 +638,7 @@ def _column_field(
     column: Column, table_name: str, query: str, problems: list[Problem]
 ) -> _Field:
     proto = _column_type(column, table_name, query, problems)
-    # У сообщений (Timestamp) присутствие и так различимо — `optional` им незачем.
-    return _Field(proto, column.name, optional=column.nullable and proto != TIMESTAMP)
+    return _Field(proto, column.name, optional=column.nullable)
 
 
 def _column_type(

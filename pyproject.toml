@@ -1,6 +1,6 @@
 [project]
 name = "sg-buddy"
-version = "0.2.0"
+version = "0.2.1"
 description = "SG Buddy — генератор sqlc-запросов и .proto по DDL-схеме"
 readme = "README.md"
 requires-python = ">=3.11"

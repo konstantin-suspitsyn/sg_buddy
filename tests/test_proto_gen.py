@@ -79,11 +79,11 @@ def test_nullable_column_is_optional():
     assert "  int32 b = 2;" in text
 
 
-def test_nullable_timestamp_is_not_optional(alias):
-    """У сообщения присутствие и так различимо — `optional` ему незачем."""
+def test_nullable_timestamp_is_optional(alias):
+    """Дата ничем не отличается от прочих колонок: NULL виден в контракте."""
     text = proto(alias, "READ", entry("GetAlias", *(col(name, show=True) for name in alias.column_names), annotation="one"))
-    assert f"  {proto_gen.TIMESTAMP} updated_at = 5;" in text
-    assert "optional google.protobuf.Timestamp" not in text
+    assert f"  optional {proto_gen.TIMESTAMP} updated_at = 5;" in text
+    assert f"  {proto_gen.TIMESTAMP} created_at = 4;" in text
 
 
 def test_timestamp_import_only_when_used(alias):
@@ -92,6 +92,127 @@ def test_timestamp_import_only_when_used(alias):
 
     without = proto(alias, "READ", entry("GetAlias", col("id", show=True), annotation="one"))
     assert proto_gen.TIMESTAMP_IMPORT not in without
+
+
+# --------------------------------------------------------------- nullable
+
+
+def nullable_table() -> ddl.Table:
+    """Рядом лежат nullable и NOT NULL колонки — разницу видно в одном файле."""
+    return ddl.parse_schema(
+        "CREATE TABLE t ("
+        " id bigint NOT NULL,"
+        " note varchar(500),"
+        " qty int NOT NULL,"
+        " seen timestamp)"
+    )[0]
+
+
+def block(*lines: str) -> str:
+    """Сообщение целиком: и порядок полей, и номера — часть контракта."""
+    return "\n".join(lines)
+
+
+def test_nullable_column_is_optional_in_the_table_message():
+    """`SELECT *` и `RETURNING *` возвращают таблицу целиком — NULL виден и там."""
+    text = proto(nullable_table(), "READ", entry("GetT", col("id"), annotation="one"))
+    assert block(
+        "message T {",
+        "  int64 id = 1;",
+        "  optional string note = 2;",
+        "  int32 qty = 3;",
+        f"  optional {proto_gen.TIMESTAMP} seen = 4;",
+        "}",
+    ) in text
+
+
+def test_nullable_column_is_optional_in_the_row_message():
+    """Своё сообщение строки собирается по тем же правилам, что и сообщение таблицы."""
+    text = proto(
+        nullable_table(),
+        "READ",
+        entry(
+            "GetT",
+            col("note", show=True),
+            col("qty", show=True),
+            col("seen", show=True),
+            annotation="one",
+        ),
+    )
+    assert block(
+        "message GetTRow {",
+        "  optional string note = 1;",
+        "  int32 qty = 2;",
+        f"  optional {proto_gen.TIMESTAMP} seen = 3;",
+        "}",
+    ) in text
+
+
+def test_parameter_of_a_nullable_column_is_optional():
+    """`WHERE note = @note`: колонка допускает NULL — вправе и параметр."""
+    text = proto(
+        nullable_table(),
+        "READ",
+        entry(
+            "GetT",
+            col("note", show=True, where=True),
+            col("qty", show=True, where=True),
+            col("seen", show=True, where=True),
+            annotation="one",
+        ),
+    )
+    assert block(
+        "message GetTRequest {",
+        "  optional string note = 1;",
+        "  int32 qty = 2;",
+        f"  optional {proto_gen.TIMESTAMP} seen = 3;",
+        "}",
+    ) in text
+
+
+def test_inserted_nullable_column_is_optional():
+    """Пустое значение в CREATE даёт `@note` — колонку заполняет вызывающий."""
+    text = proto(nullable_table(), "CREATE", entry("CreateT", col("note"), col("qty")))
+    assert block(
+        "message CreateTRequest {",
+        "  optional string note = 1;",
+        "  int32 qty = 2;",
+        "}",
+    ) in text
+
+
+def test_updated_nullable_column_is_optional():
+    """`SET note = @note` — NULL здесь осмыслен: это очистка поля."""
+    text = proto(
+        nullable_table(),
+        "UPDATE",
+        entry(
+            "UpdateT",
+            col("note", set=True),
+            col("qty", set=True),
+            col("id", where=True),
+            annotation="one",
+        ),
+    )
+    assert block(
+        "message UpdateTRequest {",
+        "  optional string note = 1;",
+        "  int32 qty = 2;",
+        "  int64 id = 3;",
+        "}",
+    ) in text
+
+
+def test_not_null_column_stays_required_everywhere():
+    """Обратная сторона: `optional` не должен налипать на NOT NULL колонки."""
+    table = nullable_table()
+    text = proto(
+        table,
+        "READ",
+        entry("GetT", col("id", show=True, where=True), col("qty", show=True), annotation="many"),
+    )
+    assert "optional int64 id" not in text
+    assert "optional int32 qty" not in text
 
 
 # ------------------------------------------------------------------- шапка
@@ -496,6 +617,28 @@ def test_outer_join_makes_the_empty_side_optional(alias, user):
     assert "  optional string u_name = 2;" in text
 
 
+def test_outer_join_makes_a_joined_timestamp_optional(alias, user):
+    """Дата исключением не является: `LEFT` не даст строки — не будет и её."""
+    text = joined_proto(
+        alias,
+        read_with_user(jcol("with_user", "u", "created_at", show=True)),
+        chains=[with_user("LEFT")],
+        tables=[alias, user],
+    )
+    assert f"  optional {proto_gen.TIMESTAMP} u_created_at = 2;" in text
+
+
+def test_inner_join_keeps_a_not_null_timestamp_required(alias, user):
+    text = joined_proto(
+        alias,
+        read_with_user(jcol("with_user", "u", "created_at", show=True)),
+        chains=[with_user("INNER")],
+        tables=[alias, user],
+    )
+    assert f"  {proto_gen.TIMESTAMP} u_created_at = 2;" in text
+    assert "optional" not in text
+
+
 def test_right_join_makes_own_columns_optional(alias, user):
     """`RIGHT` сохраняет приджойненную сторону, а свою вправе оставить пустой."""
     text = joined_proto(
@@ -530,9 +673,10 @@ def test_parameter_of_a_joined_column_knows_its_type(alias, user):
         chains=[with_user()],
         tables=[alias, user],
     )
-    # `optional` здесь от самой колонки: `bigserial` объявлен без NOT NULL.
-    # Проверяется тип — со строкой-заглушкой int64 не спутать.
-    assert "  optional int64 u_id = 1;" in text
+    # Проверяется тип — со строкой-заглушкой int64 не спутать. Обязателен:
+    # `id` — первичный ключ, а `optional` внешнего соединения до параметров
+    # не доходит, оно говорит про строку ответа.
+    assert "  int64 u_id = 1;" in text
     assert "  optional string u_external_id = 2;" in text
     # Тип нашёлся по колонке звена — гадать по совпадению имён не пришлось.
     assert "не нашёлся" not in messages(problems)

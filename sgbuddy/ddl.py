@@ -96,8 +96,9 @@ def parse_schema(text: str, source: str = "<текст>") -> list[Table]:
         if table_expr is None:
             continue
 
+        keys = _primary_key_names(statement)
         columns = tuple(
-            _column(col) for col in statement.find_all(exp.ColumnDef)
+            _column(col, keys) for col in statement.find_all(exp.ColumnDef)
         )
         if not columns:
             continue
@@ -116,15 +117,36 @@ def _table_name(table: exp.Table) -> str:
     return ".".join(parts)
 
 
-def _column(col: exp.ColumnDef) -> Column:
+def _primary_key_names(statement: exp.Create) -> frozenset[str]:
+    """Колонки ключа, объявленного строкой: `PRIMARY KEY (id)`, `(a, b)`.
+
+    Ключ, написанный у самой колонки, сюда не попадает — он приходит
+    ограничением `ColumnDef` и разбирается в `_column`.
+    """
+    return frozenset(
+        expression.name
+        for key in statement.find_all(exp.PrimaryKey)
+        for expression in key.expressions
+    )
+
+
+def _column(col: exp.ColumnDef, keys: frozenset[str] = frozenset()) -> Column:
     constraints = col.args.get("constraints") or []
     kinds = [c.args.get("kind") for c in constraints]
 
-    nullable = not any(isinstance(k, exp.NotNullColumnConstraint) for k in kinds)
+    is_pk = (
+        any(isinstance(k, exp.PrimaryKeyColumnConstraint) for k in kinds)
+        or col.name in keys
+    )
+    # PRIMARY KEY в Postgres подразумевает NOT NULL, и рядом с ключом его не
+    # пишут: `id bigserial constraint user_pk primary key` — обязательная
+    # колонка. Не учесть этого значит объявить её `optional` в контракте.
+    nullable = not is_pk and not any(
+        isinstance(k, exp.NotNullColumnConstraint) for k in kinds
+    )
     default = next(
         (k for k in kinds if isinstance(k, exp.DefaultColumnConstraint)), None
     )
-    is_pk = any(isinstance(k, exp.PrimaryKeyColumnConstraint) for k in kinds)
 
     data_type = col.args.get("kind")
 

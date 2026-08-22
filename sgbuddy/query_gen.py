@@ -17,6 +17,12 @@
   там имя таблицы Postgres не примет, и они остаются как есть;
 * пустое значение колонки — это параметр `@имя_колонки`, заполненное
   подставляется в SQL как есть (`now()`, `false`, подзапрос);
+* **первичный ключ, получающий значение параметром, помечается
+  предупреждением** — во вставке и в любом `UPDATE ... SET`, включая мягкое и
+  обратное удаление: ключ обычно выдаёт база, а значение извне ломает нумерацию
+  молча и рвёт ссылки соседних таблиц. Запрос всё равно пишется — схемы, где
+  ключ присваивает приложение, обычны. Ключ в `WHERE` не в счёт: `UpdateById`
+  только так и пишется;
 * обязательный фильтр даёт `колонка = значение`, необязательный —
   `(значение IS NULL OR колонка = значение)` с приведением типа из DDL, чтобы
   sqlc понимал тип параметра;
@@ -465,6 +471,18 @@ def _create_sql(
         problems.append(Problem(table.name, name, "INSERT без колонок"))
         return None
 
+    keys = _key_params(entry, table, COLUMN_VALUE_KEY)
+    if keys:
+        problems.append(
+            Problem(
+                table.name,
+                name,
+                f"первичный ключ приходит параметром: {keys} — обычно ключ "
+                "выдаёт база (bigserial, identity, nextval)",
+                fatal=False,
+            )
+        )
+
     names = ",\n    ".join(ident(col[COLUMN_NAME_KEY]) for col in columns)
     values = ",\n    ".join(
         _value(col.get(COLUMN_VALUE_KEY), col[COLUMN_NAME_KEY]) for col in columns
@@ -479,6 +497,36 @@ def _create_sql(
     ]
     # sqlc не примет `:one` у запроса, которому нечего вернуть.
     return _block(name, annotation, body, returning=annotation == "one")
+
+
+def _key_params(
+    entry: dict, table: Table, value_key: str, flag_key: str | None = None
+) -> str:
+    """Колонки первичного ключа, значение которым придёт параметром.
+
+    Ключ в большинстве схем выдаёт сама база — `bigserial`, `identity`,
+    `DEFAULT nextval(...)`, — и значение извне ломает нумерацию так, что падает
+    не виноватый запрос, а следующий. Но запрещать нечего: схемы, где ключ
+    присваивает приложение (uuid из кода, ключ из внешней системы), обычны, —
+    поэтому здесь только список имён, а решают, что сказать, вызывающие.
+
+    Ключ с написанным руками значением (`nextval(...)`, подзапрос) сюда не
+    попадает: автор решил сам, извне оно не приходит. `flag_key` отбирает
+    колонки, которым значение вообще присваивается: во вставке это все
+    перечисленные, в изменении — только отмеченные `SET`.
+    """
+    keys = []
+    for col in entry.get(COLUMNS_KEY) or []:
+        if flag_key is not None and not col.get(flag_key):
+            continue
+        column = table.column(col.get(COLUMN_NAME_KEY))
+        if column is None or not column.is_primary_key:
+            continue
+        if (col.get(value_key) or "").strip():
+            continue
+        keys.append(f"@{column.name}")
+
+    return ", ".join(keys)
 
 
 def _read_sql(
@@ -583,6 +631,21 @@ def _update_sql(
         problems.append(Problem(table.name, name, "UPDATE без единой изменяемой колонки"))
         return None
 
+    # Ключ в `WHERE` — обычное дело, `UpdateById` только так и пишется. Речь
+    # про `SET`: на первичный ключ ссылаются другие таблицы, и переписывать его
+    # значением извне — не то, что обычно имеют в виду.
+    keys = _key_params(entry, table, SET_VALUE_KEY, SET_KEY)
+    if keys:
+        problems.append(
+            Problem(
+                table.name,
+                name,
+                f"UPDATE переписывает первичный ключ: {keys} — ключ выдаёт база, "
+                "и на него ссылаются другие таблицы",
+                fatal=False,
+            )
+        )
+
     where = _where_block(entry, table, WHERE_VALUE_KEY)
     if not where:
         problems.append(
@@ -628,6 +691,22 @@ def _delete_sql(
                 )
             )
             return None
+
+        # Оба режима дают `UPDATE ... SET`, и ключ в нём так же не к месту, как
+        # в обычном изменении: мягкое удаление помечает строку, а не заводит её
+        # заново под другим номером.
+        keys = _key_params(entry, table, SET_VALUE_KEY, SET_KEY)
+        if keys:
+            problems.append(
+                Problem(
+                    table.name,
+                    name,
+                    f"{entry.get(MODE_KEY)} переписывает первичный ключ: {keys} — "
+                    "ключ выдаёт база, и на него ссылаются другие таблицы",
+                    fatal=False,
+                )
+            )
+
         body = [f"UPDATE {ident(table.name)}", "SET " + ",\n    ".join(assignments)]
     else:
         body = [f"DELETE FROM {ident(table.name)}"]

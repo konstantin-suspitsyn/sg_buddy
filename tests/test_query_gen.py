@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sgbuddy import query_gen
+from sgbuddy import ddl, query_gen
 from sgbuddy.query_gen import GenerationError, Param
 
 from .conftest import chain, col, crud, entry, jcol, link, table_named, with_joins
@@ -22,6 +22,145 @@ def sql(table, direction, *entries, tables=None) -> str:
 
 def messages(problems) -> str:
     return " | ".join(str(problem) for problem in problems)
+
+
+# ------------------------------------------------------------ первичный ключ
+
+
+def keyed_table():
+    """Ключ, который выдаёт база: `bigserial` с последовательностью."""
+    return ddl.parse_schema(
+        "CREATE TABLE t (id bigserial primary key, name text NOT NULL)"
+    )[0]
+
+
+def test_insert_waiting_for_the_key_is_warned_about():
+    """Ключ извне ломает нумерацию молча — вставка всё равно пишется."""
+    table = keyed_table()
+    text, problems = build(
+        table, "CREATE", entry("CreateT", col("id"), col("name"), annotation="one")
+    )
+    assert "первичный ключ приходит параметром: @id" in messages(problems)
+    assert all(not problem.fatal for problem in problems)
+    # Запрос в файле: схемы, где ключ присваивает приложение, обычны.
+    assert "@id" in text
+
+
+def test_insert_without_the_key_is_not_warned_about():
+    table = keyed_table()
+    _, problems = build(table, "CREATE", entry("CreateT", col("name"), annotation="one"))
+    assert "первичный ключ" not in messages(problems)
+
+
+def test_key_with_a_written_value_is_not_warned_about():
+    """`nextval(...)` написан руками — извне значение не приходит."""
+    table = keyed_table()
+    text, problems = build(
+        table,
+        "CREATE",
+        entry("CreateT", col("id", value="nextval('t_id_seq')"), col("name")),
+    )
+    assert "первичный ключ" not in messages(problems)
+    assert "nextval('t_id_seq')" in text
+
+
+def test_key_in_where_is_not_warned_about():
+    """`GetById` — обычная выборка: предупреждение про вставку, а не про фильтр."""
+    table = keyed_table()
+    _, problems = build(
+        table, "READ", entry("GetT", col("id", show=True, where=True), annotation="one")
+    )
+    assert "первичный ключ" not in messages(problems)
+
+
+def test_update_setting_the_key_is_warned_about():
+    """На ключ ссылаются соседние таблицы — переписывать его извне странно."""
+    table = keyed_table()
+    text, problems = build(
+        table,
+        "UPDATE",
+        entry("UpdateT", col("id", set=True), col("name", set=True), annotation="exec"),
+    )
+    assert "UPDATE переписывает первичный ключ: @id" in messages(problems)
+    assert all(not problem.fatal for problem in problems)
+    assert "id = @id" in text
+
+
+def test_update_with_the_key_only_in_where_is_silent():
+    """`UpdateById` только так и пишется — предупреждать не за что."""
+    table = keyed_table()
+    _, problems = build(
+        table,
+        "UPDATE",
+        entry("UpdateT", col("name", set=True), col("id", where=True), annotation="exec"),
+    )
+    assert "первичный ключ" not in messages(problems)
+
+
+def test_key_listed_but_not_set_is_silent():
+    """Колонка ключа в списке есть, но `SET` не отмечен — в SQL её нет."""
+    table = keyed_table()
+    text, problems = build(
+        table,
+        "UPDATE",
+        entry("UpdateT", col("id"), col("name", set=True), annotation="exec"),
+    )
+    assert "первичный ключ" not in messages(problems)
+    assert "id = " not in text
+
+
+def test_key_set_to_a_written_value_is_silent():
+    table = keyed_table()
+    _, problems = build(
+        table,
+        "UPDATE",
+        entry(
+            "UpdateT",
+            col("id", set=True, set_value="nextval('t_id_seq')"),
+            annotation="exec",
+        ),
+    )
+    assert "первичный ключ" not in messages(problems)
+
+
+@pytest.mark.parametrize("mode", [query_gen.SOFT_DELETE, query_gen.UNDELETE])
+def test_soft_delete_setting_the_key_is_warned_about(mode):
+    """Оба режима дают `UPDATE ... SET` — ключ в нём так же не к месту."""
+    table = ddl.parse_schema(
+        "CREATE TABLE t (id bigserial primary key, is_deleted boolean NOT NULL)"
+    )[0]
+    text, problems = build(
+        table,
+        "DELETE",
+        entry(
+            "DeleteT",
+            col("is_deleted", set=True, set_value="true"),
+            col("id", set=True),
+            col("id", where=True),
+            mode=mode,
+            annotation="exec",
+        ),
+    )
+    assert f"{mode} переписывает первичный ключ: @id" in messages(problems)
+    assert all(not problem.fatal for problem in problems)
+    assert "UPDATE" in text
+
+
+def test_physical_delete_has_no_set_to_warn_about():
+    """`DELETE` строку убирает целиком — присваивать в нём нечего."""
+    table = keyed_table()
+    _, problems = build(
+        table, "DELETE", entry("DeleteT", col("id", set=True), col("id", where=True))
+    )
+    assert "первичный ключ" not in messages(problems)
+
+
+def test_composite_key_is_named_whole():
+    table = ddl.parse_schema(
+        "CREATE TABLE t (a bigint, b bigint, PRIMARY KEY (a, b))"
+    )[0]
+    _, problems = build(table, "CREATE", entry("CreateT", col("a"), col("b")))
+    assert "первичный ключ приходит параметром: @a, @b" in messages(problems)
 
 
 # ---------------------------------------------------------------- имена и параметры
